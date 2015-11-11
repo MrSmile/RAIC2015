@@ -37,6 +37,11 @@ inline constexpr double relAngle(double angle)
     return rem(angle + pi, 2 * pi) - pi;
 }
 
+inline double limit(double val, double lim)
+{
+    return max(-lim, min(lim, val));
+}
+
 
 struct Vec2D
 {
@@ -161,6 +166,43 @@ inline constexpr Vec2D conj(const Vec2D &v)
 }
 
 
+
+constexpr double maxDist = 80;
+
+constexpr int physIter = 10;
+constexpr double physDt = 1.0 / physIter;
+
+double tileSize, invTileSize, tileMargin;
+int mapWidth, mapHeight, mapLine;
+
+double carAccel[2], frictMul, longFrict, crossFrict;
+double carRotFactor, rotFrictMul;
+double powerChange, turnChange;
+
+int globalTick = -1;
+
+void initConsts(const model::Game& game, const model::World& world)
+{
+    tileSize = game.getTrackTileSize();  invTileSize = 1 / tileSize;
+    tileMargin = game.getTrackTileMargin();
+
+    mapWidth = world.getWidth();  mapHeight = world.getHeight();
+    mapLine = 2 * mapWidth + 2;
+
+    carAccel[model::BUGGY] = game.getBuggyEngineForwardPower() / game.getBuggyMass() * physDt;
+    carAccel[model::JEEP] = game.getJeepEngineForwardPower() / game.getJeepMass() * physDt;
+    frictMul = pow(1 - game.getCarMovementAirFrictionFactor(), physDt);
+    longFrict = game.getCarLengthwiseMovementFrictionFactor() * physDt;
+    crossFrict = game.getCarCrosswiseMovementFrictionFactor() * physDt;
+
+    carRotFactor = game.getCarAngularSpeedFactor();
+    rotFrictMul = pow(1 - game.getCarRotationAirFrictionFactor(), physDt);
+
+    powerChange = game.getCarEnginePowerChangePerTick();
+    turnChange = game.getCarWheelTurnChangePerTick();
+}
+
+
 struct Quad
 {
     Vec2D pos, dir;
@@ -211,22 +253,11 @@ struct Quad
 };
 
 
-
-constexpr double maxDist = 80;
-
-double tileSize, invTileSize, tileMargin;
-int mapWidth, mapHeight, mapLine;
-
-int globalTick = -1;
-
-void initConsts(const model::Game& game, const model::World& world)
+struct State : public Quad
 {
-    tileSize = game.getTrackTileSize();  invTileSize = 1 / tileSize;
-    tileMargin = game.getTrackTileMargin();
-
-    mapWidth = world.getWidth();  mapHeight = world.getHeight();
-    mapLine = 2 * mapWidth + 2;
-}
+    double angle, ang_spd;
+    Vec2D spd;
+};
 
 
 struct TileMap
@@ -375,15 +406,49 @@ void MyStrategy::move(const model::Car& self, const model::World& world, const m
         // TODO
     }
 
-    move.setEnginePower(1.0);
-    move.setThrowProjectile(true);
-    move.setSpillOil(true);
+    if(self.getDurability() < 0.999)exit(0);
+    move.setEnginePower(globalTick < 250 ? 1 : 0);
+    move.setWheelTurn(globalTick < 250 ? 0.5 : -0.5);
 
-    if (world.getTick() > game.getInitialFreezeDurationTicks())
-        move.setUseNitro(true);
+    static double baseAngSpd;
+    static Vec2D predPos, predSpd;
+
+    Vec2D pos(self.getX(), self.getY());
+    Vec2D spd(self.getSpeedX(), self.getSpeedY());
+    double angle = self.getAngle(), angSpd = self.getAngularSpeed();
+
+    if(globalTick > game.getInitialFreezeDurationTicks())
+    {
+        Vec2D errPos = predPos - pos, errSpd = predSpd - spd;
+
+        cout << globalTick << ' ';
+        //cout << pos.x << ' ' << pos.y << ' ';
+        //cout << spd.x << ' ' << spd.y << ' ';
+        cout << errPos.len() << ' ' << errSpd.len() << endl;
+    }
+
+    double power = self.getEnginePower(), turn = self.getWheelTurn();
+    power += limit(move.getEnginePower() - power, powerChange);
+    turn += limit(move.getWheelTurn() - turn, turnChange);
+
+    Vec2D dir = sincos(angle);
+    Vec2D accel = carAccel[self.getType()] * power * dir;
+    double rot = carRotFactor * turn * (spd * dir);
+    angSpd += rot - baseAngSpd;  baseAngSpd = rot;
+
+    for(int i = 0; i < physIter; i++)
+    {
+        pos += spd * physDt;  spd += accel;  spd *= frictMul;
+        spd -= limit(spd * dir, longFrict) * dir + limit(spd % dir, crossFrict) * ~dir;
+
+        dir = sincos(angle += angSpd * physDt);
+        angSpd = baseAngSpd + (angSpd - baseAngSpd) * rotFrictMul;
+    }
+    predPos = pos;  predSpd = spd;
 }
 
 MyStrategy::MyStrategy()
 {
-    cout << fixed << setprecision(5);
+    //cout << fixed << setprecision(5);
+    cout << scientific << setprecision(8);
 }

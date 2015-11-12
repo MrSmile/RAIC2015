@@ -179,15 +179,14 @@ double carAccel[2], carReverse[2], frictMul, longFrict, crossFrict;
 double carRotFactor, rotFrictMul;
 double powerChange, turnChange;
 
-int globalTick = -1;
+int globalTick = -1, nextWaypoint = 0;
 
 void initConsts(const model::Game &game, const model::World &world)
 {
     tileSize = game.getTrackTileSize();  invTileSize = 1 / tileSize;
     tileMargin = game.getTrackTileMargin();
 
-    mapWidth = world.getWidth();  mapHeight = world.getHeight();
-    mapLine = 2 * mapWidth + 2;
+    mapWidth = world.getWidth();  mapHeight = world.getHeight();  mapLine = mapWidth + 1;
 
     carAccel[model::BUGGY] = game.getBuggyEngineForwardPower() / game.getBuggyMass() * physDt;
     carAccel[model::JEEP] = game.getJeepEngineForwardPower() / game.getJeepMass() * physDt;
@@ -257,10 +256,19 @@ struct Quad
 
 struct TileMap
 {
-    vector<bool> barrier;
+    vector<bool> barriers;
+    vector<int> waypoints;
+    vector<vector<unsigned>> distMap;
 
     void init(const model::World &world)
     {
+        const int line = 2 * mapLine;
+        barriers.resize(line * (mapHeight + 2), false);
+        for(int x = 0, k1 = 2, k2 = line * mapHeight + 2; x < mapWidth; x++, k1 += 2, k2 += 2)
+            barriers[k1] = barriers[k2] = true;
+        for(int y = 0, k1 = line + 1, k2 = 2 * line - 1; y < mapHeight; y++, k1 += line, k2 += line)
+            barriers[k1] = barriers[k2] = true;
+
         enum TileFlags
         {
             f_l = 1, f_r = 2, f_u = 4, f_d = 8,
@@ -283,38 +291,69 @@ struct TileMap
             0,          // CROSSROADS
         };
 
-        barrier.resize(mapLine * (mapHeight + 2), false);
         const vector<vector<model::TileType>> &map = world.getTilesXY();
         for(int x = 0; x < mapWidth; x++)for(int y = 0; y < mapWidth; y++)
         {
             int flags = tile[map[x][y]];
-            int pos = (y + 1) * mapLine + 2 * (x + 1);
-            if(flags & f_l)barrier[pos - 1] = true;
-            if(flags & f_r)barrier[pos + 1] = true;
-            if(flags & f_u)barrier[pos - mapLine] = true;
-            if(flags & f_d)barrier[pos] = true;
+            int pos = (y + 1) * line + 2 * (x + 1);
+            if(flags & f_l)barriers[pos -    1] = true;
+            if(flags & f_r)barriers[pos +    1] = true;
+            if(flags & f_u)barriers[pos - line] = true;
+            if(flags & f_d)barriers[pos +    0] = true;
         }
 
         /*
         for(int x = 0; x < mapWidth; x++)for(int y = 0; y < mapWidth; y++)
         {
             int flags = 0;
-            int pos = (y + 1) * mapLine + 2 * (x + 1);
-            if(barrier[pos - 1])flags |= f_l;
-            if(barrier[pos + 1])flags |= f_r;
-            if(barrier[pos - mapLine])flags |= f_u;
-            if(barrier[pos])flags |= f_d;
+            int pos = (y + 1) * line + 2 * (x + 1);
+            if(barriers[pos -    1])flags |= f_l;
+            if(barriers[pos +    1])flags |= f_r;
+            if(barriers[pos - line])flags |= f_u;
+            if(barriers[pos +    0])flags |= f_d;
             assert(flags == tile[map[x][y]]);
         }
         */
+
+        const vector<vector<int>> &wpts = world.getWaypoints();
+        waypoints.reserve(wpts.size());  distMap.resize(wpts.size());
+        for(auto &&pt : wpts)waypoints.push_back(pt[1] * mapLine + pt[0]);
     }
 
-    double calcDist(const Quad &quad) const
+    static void pathfinderUpdate(vector<unsigned> &map, vector<int> &queue, int pos, unsigned dist)
+    {
+        if(map[pos] <= dist)return;  map[pos] = dist;  queue.push_back(pos);
+    }
+
+    const vector<unsigned> &waypointDistMap(int index)
+    {
+        vector<unsigned> &map = distMap[index];  if(map.size())return map;
+
+        const int line = 2 * mapLine;
+        vector<int> queue, next;  queue.push_back(waypoints[index]);
+        map.resize(mapHeight * mapLine, -1);  map[waypoints[index]] = 0;
+        for(unsigned dist = 1; queue.size(); dist++)
+        {
+            for(int k : queue)
+            {
+                int p = 2 * k + line + 2;
+                if(!barriers[p -    1])pathfinderUpdate(map, next, k -       1, dist);
+                if(!barriers[p +    1])pathfinderUpdate(map, next, k +       1, dist);
+                if(!barriers[p - line])pathfinderUpdate(map, next, k - mapLine, dist);
+                if(!barriers[p +    0])pathfinderUpdate(map, next, k + mapLine, dist);
+            }
+            queue.clear();  swap(queue, next);
+        }
+        return map;
+    }
+
+    double borderDist(const Quad &quad) const
     {
         Vec2D offs = quad.pos * invTileSize + Vec2D(0.5, 0.5);
         int x = int(offs.x), y = int(offs.y);
-        int px = y * mapLine + 2 * x, py = px + 1;
-        int dx = 2, dy = mapLine;
+
+        int dx = 2, dy = 2 * mapLine;
+        int px = x * dx + y * dy, py = px + 1;
 
         Quad check = quad;
         check.pos -= Vec2D(x, y) * tileSize;
@@ -354,7 +393,7 @@ struct TileMap
             /* _|_ */ f_c,
         };
 
-        int flags = work[(barrier[py] ? 1 : 0) | (barrier[px + dx] ? 2 : 0) | (barrier[py + dy] ? 4 : 0)];
+        int flags = work[(barriers[py] ? 1 : 0) | (barriers[px + dx] ? 2 : 0) | (barriers[py + dy] ? 4 : 0)];
 
         double dist = maxDist;
         Vec2D rw = check.half_w * check.dir, rh = check.half_h * ~check.dir;
@@ -458,6 +497,20 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
 
         // TODO
     }
+
+    {
+        int &next = nextWaypoint;
+        int pos = self.getNextWaypointY() * mapLine + self.getNextWaypointX();
+        while(tileMap.waypoints[next] != pos)
+            if(size_t(++next) >= tileMap.waypoints.size())next = 0;
+        const vector<unsigned> &map = tileMap.waypointDistMap(next);
+        for(int y = 0, k = 0; y < mapHeight; y++, k++)
+        {
+            for(int x = 0; x < mapWidth; x++, k++)cout << setw(3) << int(map[k]);  cout << endl;
+        }
+        exit(0);
+    }
+
 
     if(self.getDurability() < 0.999)exit(0);
     move.setEnginePower(globalTick < 250 ? 1 : 0);

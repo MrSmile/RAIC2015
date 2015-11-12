@@ -175,13 +175,13 @@ constexpr double physDt = 1.0 / physIter;
 double tileSize, invTileSize, tileMargin;
 int mapWidth, mapHeight, mapLine;
 
-double carAccel[2], frictMul, longFrict, crossFrict;
+double carAccel[2], carReverse[2], frictMul, longFrict, crossFrict;
 double carRotFactor, rotFrictMul;
 double powerChange, turnChange;
 
 int globalTick = -1;
 
-void initConsts(const model::Game& game, const model::World& world)
+void initConsts(const model::Game &game, const model::World &world)
 {
     tileSize = game.getTrackTileSize();  invTileSize = 1 / tileSize;
     tileMargin = game.getTrackTileMargin();
@@ -191,11 +191,13 @@ void initConsts(const model::Game& game, const model::World& world)
 
     carAccel[model::BUGGY] = game.getBuggyEngineForwardPower() / game.getBuggyMass() * physDt;
     carAccel[model::JEEP] = game.getJeepEngineForwardPower() / game.getJeepMass() * physDt;
+    carReverse[model::BUGGY] = game.getBuggyEngineRearPower() / game.getBuggyMass() * physDt;
+    carReverse[model::JEEP] = game.getJeepEngineRearPower() / game.getJeepMass() * physDt;
     frictMul = pow(1 - game.getCarMovementAirFrictionFactor(), physDt);
     longFrict = game.getCarLengthwiseMovementFrictionFactor() * physDt;
     crossFrict = game.getCarCrosswiseMovementFrictionFactor() * physDt;
 
-    carRotFactor = game.getCarAngularSpeedFactor();
+    carRotFactor = game.getCarAngularSpeedFactor() * physDt;
     rotFrictMul = pow(1 - game.getCarRotationAirFrictionFactor(), physDt);
 
     powerChange = game.getCarEnginePowerChangePerTick();
@@ -253,18 +255,11 @@ struct Quad
 };
 
 
-struct State : public Quad
-{
-    double angle, ang_spd;
-    Vec2D spd;
-};
-
-
 struct TileMap
 {
     vector<bool> barrier;
 
-    void init(const model::World& world)
+    void init(const model::World &world)
     {
         enum TileFlags
         {
@@ -392,8 +387,66 @@ struct TileMap
 TileMap tileMap;
 
 
+struct CarState
+{
+    Vec2D pos, spd, dir;
+    double angle, angSpd;
 
-void MyStrategy::move(const model::Car& self, const model::World& world, const model::Game& game, model::Move& move)
+    int leftBroken, leftSliding, leftNitro;
+    double power, powerTarget;
+    double turn, turnTarget;
+    bool brake;
+
+    CarState(const model::Car &car) : pos(car.getX(), car.getY()), spd(car.getSpeedX(), car.getSpeedY()),
+        dir(sincos(car.getAngle())), angle(car.getAngle()), angSpd(0)  // TODO: car.getAngularSpeed()
+    {
+    }
+
+    void nextStep(model::CarType type, double power, double turn, double frict)
+    {
+        Vec2D accel = (power < 0 ? carReverse : carAccel)[type] * power * dir;
+        double rot = carRotFactor * turn * (spd * dir);
+        for(int i = 0; i < physIter; i++)
+        {
+            pos += spd * physDt;  spd += accel;  spd *= frictMul;
+            spd -= limit(spd * dir, frict) * dir + limit(spd % dir, crossFrict) * ~dir;
+            dir = sincos(angle += rot + angSpd * physDt);  angSpd *= rotFrictMul;
+        }
+    }
+
+    void activateNitro()
+    {
+        power = powerTarget = 1;  leftNitro = 120;  // TODO: const
+    }
+
+    void nextStep(model::CarType type)
+    {
+        // TODO: broken & sliding
+
+        nextStep(type, brake ? 0 : (leftNitro ? 2 : power), turn, brake ? crossFrict : longFrict);
+    }
+};
+
+
+struct Track
+{
+    enum EventType
+    {
+        e_accel, e_reverse, e_nitro, e_brake, e_unbrake, e_left, e_center, e_right
+    };
+
+    struct Event
+    {
+        int time;  EventType event;
+    };
+
+    vector<Event> events;
+    double score;
+};
+
+
+
+void MyStrategy::move(const model::Car &self, const model::World &world, const model::Game &game, model::Move &move)
 {
     if(globalTick != world.getTick())
     {
@@ -409,13 +462,15 @@ void MyStrategy::move(const model::Car& self, const model::World& world, const m
     if(self.getDurability() < 0.999)exit(0);
     move.setEnginePower(globalTick < 250 ? 1 : 0);
     move.setWheelTurn(globalTick < 250 ? 0.5 : -0.5);
+    move.setBrake(globalTick > 250);
 
     static double baseAngSpd;
     static Vec2D predPos, predSpd;
 
     Vec2D pos(self.getX(), self.getY());
     Vec2D spd(self.getSpeedX(), self.getSpeedY());
-    double angle = self.getAngle(), angSpd = self.getAngularSpeed();
+    double angle = self.getAngle();
+    double angSpd = self.getAngularSpeed() - baseAngSpd;
 
     if(globalTick > game.getInitialFreezeDurationTicks())
     {
@@ -430,21 +485,19 @@ void MyStrategy::move(const model::Car& self, const model::World& world, const m
     double power = self.getEnginePower(), turn = self.getWheelTurn();
     power += limit(move.getEnginePower() - power, powerChange);
     turn += limit(move.getWheelTurn() - turn, turnChange);
+    if(move.isBrake())power = 0;
 
     Vec2D dir = sincos(angle);
     Vec2D accel = carAccel[self.getType()] * power * dir;
+    double frict = move.isBrake() ? crossFrict : longFrict;
     double rot = carRotFactor * turn * (spd * dir);
-    angSpd += rot - baseAngSpd;  baseAngSpd = rot;
-
     for(int i = 0; i < physIter; i++)
     {
         pos += spd * physDt;  spd += accel;  spd *= frictMul;
-        spd -= limit(spd * dir, longFrict) * dir + limit(spd % dir, crossFrict) * ~dir;
-
-        dir = sincos(angle += angSpd * physDt);
-        angSpd = baseAngSpd + (angSpd - baseAngSpd) * rotFrictMul;
+        spd -= limit(spd * dir, frict) * dir + limit(spd % dir, crossFrict) * ~dir;
+        dir = sincos(angle += rot + angSpd * physDt);  angSpd *= rotFrictMul;
     }
-    predPos = pos;  predSpd = spd;
+    baseAngSpd = rot * physIter;  predPos = pos;  predSpd = spd;
 }
 
 MyStrategy::MyStrategy()

@@ -137,12 +137,12 @@ inline constexpr Vec2D normalize(const Vec2D &v)
     return v / v.len();
 }
 
-inline constexpr Vec2D sincos(double angle)
+inline constexpr Vec2D sincos_slow(double angle)
 {
     return Vec2D(cos(angle), sin(angle));
 }
 
-inline constexpr Vec2D sincos_fast(float angle)
+inline constexpr Vec2D sincos(float angle)
 {
     return Vec2D(cos(angle), sin(angle));
 }
@@ -627,7 +627,7 @@ struct CarState
                 score -= slickPenalty;
             }
         }
-        return borderDist;
+        score -= distPenalty * pow(1 - borderDist / maxDist, distPower);  return borderDist;
     }
 
     bool activateNitro(int time)
@@ -653,7 +653,6 @@ struct CarState
         }
         double brd = update(info, time, curPower, turn, frict);
         if(brd < (time < 20 ? -epsDist : epsDist))return false;  // TODO: ~~~
-        score -= distPenalty * pow(1 - dist / maxDist, distPower);
 
         Vec2D offs = pos * invTileSize;
         int k = int(offs.y) * mapLine + int(offs.x);
@@ -968,7 +967,7 @@ struct Optimizer
 
         double score = state.score - time;
         unordered_map<int, Plan> &cur = dist > bestDist ? next : best;
-        Plan &track = cur[state.classify()];  if(!(score > track.score))return;
+        Plan &track = cur[state.classify() & ~0x80];  if(!(score > track.score))return;
         track.set(current, mnv, last, score);
     }
 
@@ -1007,12 +1006,16 @@ struct Optimizer
         }
         if(sel)
         {
+#ifdef PRINT_LOG
             sel->print();
+#endif
             sel->execute(move);  swap(*sel, old);
         }
         else
         {
+#ifdef PRINT_LOG
             cout << "Path: NOT FOUND!!!" << endl;
+#endif
             move.setEnginePower(-1);  move.setWheelTurn(0);
             move.setUseNitro(false);  move.setBrake(false);
             old = Plan();

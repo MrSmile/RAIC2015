@@ -186,7 +186,7 @@ constexpr double pickupBonus = 5;
 constexpr double scoreBonus = 500;
 constexpr int repairPower = 4;
 constexpr double repairBonus = 500;
-constexpr double slickPenalty = 500;
+constexpr double slickPenalty = 5000;
 
 constexpr int optStep = 16, brakeTime = 20;
 constexpr int mnvDuration = 64, mnvTail = 64, stageCount = 3;
@@ -652,7 +652,7 @@ struct CarState
             curPower = 0;  frict = crossFrict;
         }
         double brd = update(info, time, curPower, turn, frict);
-        if(brd < (time < 20 ? -epsDist : epsDist))return false;  // TODO: ~~~
+        if(brd < -epsDist)return false;  // TODO: correct collisions
 
         Vec2D offs = pos * invTileSize;
         int k = int(offs.y) * mapLine + int(offs.x);
@@ -1016,7 +1016,8 @@ struct Optimizer
 #ifdef PRINT_LOG
             cout << "Path: NOT FOUND!!!" << endl;
 #endif
-            move.setEnginePower(-1);  move.setWheelTurn(0);
+            move.setEnginePower(-1);
+            move.setWheelTurn(2 * ((globalTick >> 8) & 1) - 1);
             move.setUseNitro(false);  move.setBrake(false);
             old = Plan();
         }

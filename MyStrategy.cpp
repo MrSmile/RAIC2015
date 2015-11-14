@@ -164,8 +164,9 @@ constexpr double maxDist = 32, epsDist = 1;
 constexpr double timeEps = 0.001;
 
 constexpr double tileBonus = 1000;
-constexpr int optStep = 16, optLookahead = numeric_limits<int>::max();
+constexpr int optStep = 16, brakeTime = 20;
 constexpr int mnvDuration = 64, mnvTail = 64, stageCount = 3;
+constexpr int infTime = numeric_limits<int>::max();
 
 
 constexpr int physIter = 10;
@@ -574,6 +575,13 @@ template<typename T> void evaluatePath(const CarInfo &info, CarState &state, T &
 
 template<typename T> void generatePathsTail(const CarInfo &info, CarState state, T &handler, Maneuver &mnv)
 {
+    int brakeEnd = mnv.time2 + brakeTime;
+    if(brakeEnd >= mnv.start + mnvDuration)
+    {
+        CarState state1 = state;  int time = mnv.time2;  mnv.turn2 = mnv.turn1;
+        while(time < brakeEnd)if(!state1.nextStep(info, time++, 1, mnv.turn1, true))return;
+        evaluatePath(info, state1, handler, mnv, brakeEnd);
+    }
     int turnEnd = mnv.time2 + int(abs(state.turn) * invTurnChange + timeEps);  mnv.turn2 = 0;
     if(turnEnd >= mnv.start + mnvDuration)
     {
@@ -594,7 +602,7 @@ template<typename T> void generatePathsTurn(const CarInfo &info, CarState state,
         if((time + 2 * globalTick) % optStep)continue;  mnv.time2 = time;
         generatePathsTail(info, state, handler, mnv);
     }
-    mnv.time2 = optLookahead;  mnv.turn2 = mnv.turn1;
+    mnv.time2 = infTime;  mnv.turn2 = mnv.turn1;
     evaluatePath(info, state, handler, mnv, mnvEnd);
 }
 
@@ -617,7 +625,7 @@ template<typename T> void generatePaths(const CarInfo &info, CarState state, T &
         mnv.turn1 = -1;  generatePathsTurn(info, state, handler, mnv);
         mnv.turn1 = +1;  generatePathsTurn(info, state, handler, mnv);
     }
-    mnv.time1 = mnv.time2 = optLookahead;  mnv.turn1 = mnv.turn2 = 0;
+    mnv.time1 = mnv.time2 = infTime;  mnv.turn1 = mnv.turn2 = 0;
     evaluatePath(info, state, handler, mnv, mnvEnd);
 }
 
@@ -690,46 +698,39 @@ struct Plan
             prev = Position();  flags = 0;
         }
 
-        void dumpEvents()
+        void dumpEvents(int nextTime)
         {
+            if(time >= nextTime)return;
+
             constexpr EventType turns[] = {e_left, e_center, e_right};
             if(prev.power != next.power)events.emplace_back(time, next.power < 0 ? e_reverse : e_accel);
             if(prev.brake != next.brake)events.emplace_back(time, next.brake ? e_brake : e_unbrake);
             if(prev.turn != next.turn)events.emplace_back(time, turns[next.turn + 1]);
             if(flags & f_nitro)events.emplace_back(time, e_nitro);
+
+            prev = next;  time = nextTime;  flags = 0;
         }
 
         void append(int eventTime, EventType type)
         {
-            if(time < eventTime)
-            {
-                dumpEvents();  prev = next;  time = eventTime;  flags = 0;
-            }
-            flags |= next.update(type);
+            dumpEvents(eventTime);  flags |= next.update(type);
         }
 
         void append(const Maneuver &mnv)
         {
-            if(time < mnv.start)
+            dumpEvents(mnv.start);  next = Position();
+            if(mnv.time1 >= infTime)return;  dumpEvents(mnv.time1);  next.turn = mnv.turn1;
+            if(mnv.time2 >= infTime)return;  dumpEvents(mnv.time2);
+            if(mnv.turn2 == mnv.turn1)  // brake
             {
-                dumpEvents();  prev = next;  time = mnv.start;  flags = 0;
+                next.brake = true;  dumpEvents(mnv.time2 + brakeTime);  next.brake = false;
             }
-            next = Position();  if(mnv.time1 >= optLookahead)return;
-            if(time < mnv.time1)
-            {
-                dumpEvents();  prev = next;  time = mnv.time1;  flags = 0;
-            }
-            next.turn = mnv.turn1;  if(mnv.time2 >= optLookahead)return;
-            if(time < mnv.time2)
-            {
-                dumpEvents();  prev = next;  time = mnv.time2;  flags = 0;
-            }
-            next.turn = mnv.turn2;
+            else next.turn = mnv.turn2;
         }
 
         void finalize()
         {
-            dumpEvents();  events.emplace_back(optLookahead, e_end);
+            dumpEvents(infTime);  events.emplace_back(infTime, e_end);
         }
     };
 
@@ -739,7 +740,7 @@ struct Plan
 
     Plan() : score(-numeric_limits<double>::infinity())
     {
-        events.emplace_back(optLookahead, e_end);
+        events.emplace_back(infTime, e_end);
     }
 
     void set(const Plan *prev, const Maneuver &mnv, const CarState &last_, double score_)
@@ -781,7 +782,7 @@ struct Plan
             mng.append(0, old[pos].type);
         mng.execute(move);
 
-        for(; old[pos].time < optLookahead; pos++)
+        for(; old[pos].time < infTime; pos++)
             mng.append(old[pos].time - 1, old[pos].type);
         mng.finalize();
     }
@@ -800,7 +801,7 @@ struct Optimizer
 
         Maneuver mnv;
         mnv.start = mnv.time1 = lim;  mnv.turn1 = pos.turn;
-        mnv.time2 = optLookahead;  mnv.turn2 = 0;
+        mnv.time2 = infTime;  mnv.turn2 = 0;
 
         int dist = state.distance();  lim += mnvTail;
         do if(time >= lim || !state.nextStep(info, time++, 1, mnv.turn2, false))return;
@@ -826,8 +827,6 @@ struct Optimizer
         unordered_map<int, Plan> &cur = dist > bestDist ? next : best;
         Plan &track = cur[state.classify()];  if(!(score > track.score))return;
         track.set(current, mnv, last, score);
-
-        //cout << (main ? " + " : " - ") << score << ' ';  track.print();
     }
 
     void process(const model::Car &car)
@@ -839,25 +838,20 @@ struct Optimizer
         reset(info, pos, 0);  current = nullptr;
         generatePaths(info, state, *this, 0);
 
-        //cout << ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>" << endl;
         for(int i = 1; i < stageCount; i++)
         {
             swap(prev, best);  next.clear();  reset(info, pos, i * mnvDuration);
             for(auto &track : prev)
             {
                 current = &track.second;
-                //current->print();
                 generatePaths(info, current->last, *this, i * mnvDuration);
             }
-            //cout << "--------------------------------------------------------" << endl;
             if(!best.size())
             {
                 swap(prev, best);  break;
             }
             prev.clear();
         }
-        //for(auto &track : best)track.second.print();
-        //cout << "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<" << endl;
     }
 
     void execute(model::Move &move)

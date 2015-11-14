@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <limits>
+#include <set>
 
 #include <iostream>  // DEBUG
 #include <iomanip>  // DEBUG
@@ -157,6 +158,23 @@ inline constexpr Vec2D conj(const Vec2D &v)
 }
 
 
+struct RectInfo
+{
+    double invMass, invAngMass;
+
+    void set(double mass, double hw, double hh)
+    {
+        invMass = 1 / mass;  invAngMass = 3 * invMass / (hw * hw + hh * hh);
+    }
+};
+
+struct CarInfo : public RectInfo
+{
+    double carAccel, carReverse;
+
+    void set(double mass, double power, double rear);
+};
+
 
 constexpr int distPower = 4;
 constexpr double distPenalty = 10;
@@ -164,6 +182,12 @@ constexpr double maxDist = 32, epsDist = 1;
 constexpr double timeEps = 0.001;
 
 constexpr double tileBonus = 1000;
+constexpr double pickupBonus = 5;
+constexpr double scoreBonus = 500;
+constexpr int repairPower = 4;
+constexpr double repairBonus = 500;
+constexpr double slickPenalty = 500;
+
 constexpr int optStep = 16, brakeTime = 20;
 constexpr int mnvDuration = 64, mnvTail = 64, stageCount = 3;
 constexpr int infTime = numeric_limits<int>::max();
@@ -178,16 +202,21 @@ int mapWidth, mapHeight, mapLine;
 int nitroDuration, nitroCooldown;
 double nitroPower;
 
-struct CarInfo
-{
-    double carAccel, carReverse;
-};
-
-double carHalfWidth, carHalfHeight;  CarInfo carInfo[2];
+double carHalfWidth, carHalfHeight, carRadius;  CarInfo carInfo[2];
 double frictMul, longFrict, crossFrict, carRotFactor, rotFrictMul;
 double powerChange, invPowerChange, turnChange, invTurnChange;
 
+double bonusHalfSize;  RectInfo bonusInfo;
+double slickRadius;  int slidingTime;
+
 int globalTick = -1, nextWaypoint = 0;
+
+void CarInfo::set(double mass, double power, double rear)
+{
+    RectInfo::set(mass, carHalfWidth, carHalfHeight);
+    carAccel   = power * invMass * physDt;
+    carReverse = rear  * invMass * physDt;
+}
 
 void initConsts(const model::Game &game, const model::World &world)
 {
@@ -200,11 +229,13 @@ void initConsts(const model::Game &game, const model::World &world)
     nitroCooldown = game.getUseNitroCooldownTicks();
     nitroPower = game.getNitroEnginePowerFactor();
 
-    carHalfWidth = game.getCarWidth() / 2;  carHalfHeight = game.getCarHeight() / 2;
-    carInfo[model::BUGGY].carAccel = game.getBuggyEngineForwardPower() / game.getBuggyMass() * physDt;
-    carInfo[model::JEEP].carAccel = game.getJeepEngineForwardPower() / game.getJeepMass() * physDt;
-    carInfo[model::BUGGY].carReverse = game.getBuggyEngineRearPower() / game.getBuggyMass() * physDt;
-    carInfo[model::JEEP].carReverse = game.getJeepEngineRearPower() / game.getJeepMass() * physDt;
+    carHalfWidth = game.getCarWidth() / 2;
+    carHalfHeight = game.getCarHeight() / 2;
+    carRadius = Vec2D(carHalfWidth, carHalfHeight).len();
+    carInfo[model::BUGGY].set(game.getBuggyMass(),
+        game.getBuggyEngineForwardPower(), game.getBuggyEngineRearPower());
+    carInfo[model::JEEP].set(game.getJeepMass(),
+        game.getJeepEngineForwardPower(), game.getJeepEngineRearPower());
 
     frictMul = pow(1 - game.getCarMovementAirFrictionFactor(), physDt);
     longFrict = game.getCarLengthwiseMovementFrictionFactor() * physDt;
@@ -214,62 +245,110 @@ void initConsts(const model::Game &game, const model::World &world)
 
     powerChange = game.getCarEnginePowerChangePerTick();  invPowerChange = 1 / powerChange;
     turnChange = game.getCarWheelTurnChangePerTick();  invTurnChange = 1 / turnChange;
+
+    bonusHalfSize = game.getBonusSize() / 2;
+    bonusInfo.set(game.getBonusMass(), bonusHalfSize, bonusHalfSize);
+
+    slickRadius = game.getOilSlickRadius();
+    slidingTime = game.getMaxOiledStateDurationTicks();
 }
 
 
 struct Quad
 {
     Vec2D pos, dir;
-    double half_w, half_h;
+    double hw, hh;
 
     Quad() = default;
 
-    Quad(const Vec2D &pos_, const Vec2D &dir_, double hw, double hh) :
-        pos(pos_), dir(dir_), half_w(hw), half_h(hh)
+    Quad(const Vec2D &pos_, const Vec2D &dir_, double hw_, double hh_) :
+        pos(pos_), dir(dir_), hw(hw_), hh(hh_)
     {
     }
 
     Quad(const model::RectangularUnit &unit) : pos(unit.getX(), unit.getY()),
-        dir(sincos(unit.getAngle())), half_w(unit.getWidth() / 2), half_h(unit.getHeight() / 2)
+        dir(sincos(unit.getAngle())), hw(unit.getWidth() / 2), hh(unit.getHeight() / 2)
     {
     }
 
-    Quad(const Vec2D &start, const Vec2D &delta, double size) : half_h(size / 2)
+    Quad(const Vec2D &start, const Vec2D &delta, double size) : hh(size / 2)
     {
-        dir = delta / 2;  half_w = dir.len();  pos = start + dir;  dir /= half_w;
+        dir = delta / 2;  hw = dir.len();  pos = start + dir;  dir /= hw;
     }
 
     Quad move(const Vec2D &pt) const
     {
-        return Quad(pt, dir, half_w, half_h);
+        return Quad(pt, dir, hw, hh);
     }
 
     bool checkPoint(const Vec2D &pt, double rad = 0) const
     {
         Vec2D dr = pt - pos;
-        return abs(dr * dir) < half_w + rad && abs(dr % dir) < half_h + rad;
+        return abs(dr * dir) < hw + rad && abs(dr % dir) < hh + rad;
     }
 
-    bool cross(const Quad &q) const
+    void collideSide(double proj, double offs, double dot, double crs,
+        const Vec2D &hitDir, double &minDepth, Vec2D &norm, Vec2D &pt) const
+    {
+        double depth = offs + hw * abs(dot) + hh * abs(crs) - abs(proj);
+        if(!(minDepth > depth))return;
+
+        minDepth = depth;
+        norm = signbit(proj) ? -hitDir : hitDir;  pt = pos;
+        pt += (signbit(dot) == signbit(proj) ? -hw : hw) *  dir;
+        pt += (signbit(crs) == signbit(proj) ? -hh : hh) * ~dir;
+    }
+
+    double collide(const Quad &q, Vec2D &norm, Vec2D &pt) const
     {
         Vec2D dr = q.pos - pos;
-        //if(dr.sqr() > sqr(half_w + half_h + q.half_w + q.half_h))return false;
-
-        double dot = abs(dir * q.dir), cross = abs(dir % q.dir);
-        if(!(abs(dr * dir) < half_w + q.half_w * dot + q.half_h * cross))return false;
-        if(!(abs(dr % dir) < half_h + q.half_h * dot + q.half_w * cross))return false;
-        if(!(abs(dr * q.dir) < q.half_w + half_w * dot + half_h * cross))return false;
-        if(!(abs(dr % q.dir) < q.half_h + half_h * dot + half_w * cross))return false;
-        return true;
+        double dot = dir * q.dir, crs = dir % q.dir;
+        double minDepth = numeric_limits<double>::infinity();
+        q.collideSide(dr * dir,   hw,  dot,  crs,    dir, minDepth, norm, pt);
+        q.collideSide(dr % dir,   hh,  crs, -dot,   ~dir, minDepth, norm, pt);
+        collideSide(dr * q.dir, q.hw, -dot,  crs,  q.dir, minDepth, norm, pt);
+        collideSide(dr % q.dir, q.hh, -crs, -dot, ~q.dir, minDepth, norm, pt);
+        /*
+        if(minDepth > 0)
+        {
+            if(!checkPoint(pt, 1))cout << "-------------------------------------------------> NOT IN FIRST" << endl;
+            if(!q.checkPoint(pt, 1))cout << "-------------------------------------------------> NOT IN SECOND" << endl;
+        }
+        */
+        return minDepth;
     }
 };
 
+
+struct Bonus : public Quad
+{
+    unsigned flag;  model::BonusType type;
+
+    Bonus() = default;
+
+    Bonus(int index, const model::Bonus &bonus) : Quad(bonus), flag(1 << (index & 31)), type(bonus.getType())
+    {
+    }
+};
+
+struct Slick
+{
+    Vec2D pos;  int endTime;
+
+    Slick() = default;
+
+    Slick(const model::OilSlick &slick) : pos(slick.getX(), slick.getY()), endTime(slick.getRemainingLifetime())
+    {
+    }
+};
 
 struct TileMap
 {
     vector<bool> borders;
     vector<int> waypoints;
     vector<vector<unsigned>> distMap;
+    vector<vector<Bonus>> bonuses;
+    vector<vector<Slick>> slicks;
 
     void init(const model::World &world)
     {
@@ -329,6 +408,40 @@ struct TileMap
         const vector<vector<int>> &wpts = world.getWaypoints();
         waypoints.reserve(wpts.size());  distMap.resize(wpts.size());
         for(auto &&pt : wpts)waypoints.push_back(pt[1] * mapLine + pt[0]);
+
+        bonuses.resize(mapHeight * mapLine);
+        slicks.resize(mapHeight * mapLine);
+    }
+
+    void reset(const model::World &world)
+    {
+        for(auto &list : bonuses)list.clear();  int index = 0;
+        double shift = (carRadius + bonusHalfSize) * invTileSize;
+        for(auto &bonus : world.getBonuses())
+        {
+            Bonus next(index++, bonus);  Vec2D offs = next.pos * invTileSize;
+            int x = int(offs.x), y = int(offs.y), k = y * mapLine + x;  offs -= Vec2D(x, y);
+
+            bonuses[k].push_back(next);
+            if(x >             0 && offs.x <     shift)bonuses[k -       1].push_back(next);
+            if(x < mapWidth  - 1 && offs.x > 1 - shift)bonuses[k +       1].push_back(next);
+            if(y >             0 && offs.y <     shift)bonuses[k - mapLine].push_back(next);
+            if(y < mapHeight - 1 && offs.y > 1 - shift)bonuses[k + mapLine].push_back(next);
+        }
+
+        for(auto &list : slicks)list.clear();
+        shift = (carRadius + slickRadius) * invTileSize;
+        for(auto &slick : world.getOilSlicks())
+        {
+            Slick next(slick);  Vec2D offs = next.pos * invTileSize;
+            int x = int(offs.x), y = int(offs.y), k = y * mapLine + x;  offs -= Vec2D(x, y);
+
+            slicks[k].push_back(next);
+            if(x >             0 && offs.x <     shift)slicks[k -       1].push_back(next);
+            if(x < mapWidth  - 1 && offs.x > 1 - shift)slicks[k +       1].push_back(next);
+            if(y >             0 && offs.y <     shift)slicks[k - mapLine].push_back(next);
+            if(y < mapHeight - 1 && offs.y > 1 - shift)slicks[k + mapLine].push_back(next);
+        }
     }
 
     static void pathfinderUpdate(vector<unsigned> &map, vector<int> &queue, int pos, unsigned dist)
@@ -358,7 +471,7 @@ struct TileMap
         return map;
     }
 
-    double borderDist(Vec2D pos, Vec2D dir, double half_w, double half_h) const
+    double borderDist(Vec2D pos, Vec2D dir, double hw, double hh) const
     {
         Vec2D offs = pos * invTileSize + Vec2D(0.5, 0.5);
         int x = int(offs.x), y = int(offs.y);
@@ -403,7 +516,7 @@ struct TileMap
         int flags = work[(borders[py] ? 1 : 0) | (borders[px + dx] ? 2 : 0) | (borders[py + dy] ? 4 : 0)];
 
         double dist = maxDist;
-        Vec2D rw = half_w * dir, rh = half_h * ~dir;
+        Vec2D rw = hw * dir, rh = hh * ~dir;
         Vec2D minX = pos + (signbit(rw.x) ? rw : -rw) + (signbit(rh.x) ? rh : -rh);
         Vec2D minY = pos + (signbit(rw.y) ? rw : -rw) + (signbit(rh.y) ? rh : -rh);
         if(flags & f_h)
@@ -422,8 +535,8 @@ struct TileMap
         }
         if(flags & f_r)
         {
-            double dot = abs(pos * dir), cross = abs(pos % dir);
-            Vec2D d(max(0.0, dot - half_w), max(0.0, cross - half_h));
+            double dot = abs(pos * dir), crs = abs(pos % dir);
+            Vec2D d(max(0.0, dot - hw), max(0.0, crs - hh));
             dist = min(dist, d.len() - tileMargin);
         }
         return dist;
@@ -440,10 +553,11 @@ struct CarState
 
     int breakEnd, slidingEnd, nitroEnd;
     int nitroCount, ammoCount, oilCount;
-    double power, turn;
+    double durability, power, turn;
 
     int waypoint;
     unsigned base, dist;
+    unsigned consumed;
     double score;
 
     CarState() = default;
@@ -457,6 +571,7 @@ struct CarState
         nitroCount = car.getNitroChargeCount();
         ammoCount = car.getProjectileCount();
         oilCount = car.getOilCanisterCount();
+        durability = car.getDurability();
         power = car.getEnginePower();
         turn = car.getWheelTurn();
 
@@ -469,10 +584,10 @@ struct CarState
         Vec2D offs = pos * invTileSize;
         int k = int(offs.y) * mapLine + int(offs.x);
         base = dist = tileMap.waypointDistMap(waypoint)[k];
-        score = 0;
+        consumed = 0;  score = 0;
     }
 
-    double update(const CarInfo &info, double power, double turn, double frict)
+    double update(const CarInfo &info, int time, double power, double turn, double frict)
     {
         Vec2D accel = (signbit(power) ? info.carReverse : info.carAccel) * power * dir;
         double rot = carRotFactor * turn * (spd * dir), borderDist = maxDist;
@@ -482,7 +597,35 @@ struct CarState
             spd -= limit(spd * dir, frict) * dir + limit(spd % dir, crossFrict) * ~dir;
             dir = sincos(angle += rot + angSpd * physDt);  angSpd *= rotFrictMul;
 
-            borderDist = min(borderDist, tileMap.borderDist(pos, dir, carHalfWidth, carHalfHeight));
+            Quad rect(pos, dir, carHalfWidth, carHalfHeight);
+            borderDist = min(borderDist, tileMap.borderDist(pos, dir, rect.hw, rect.hh));
+
+            Vec2D offs = pos * invTileSize;  int k = int(offs.y) * mapLine + int(offs.x);
+            for(auto &bonus : tileMap.bonuses[k])if((consumed & bonus.flag) != bonus.flag)
+            {
+                Vec2D norm, pt;
+                double depth = bonus.collide(rect, norm, pt);
+                if(depth < 0)continue;  consumed |= bonus.flag;
+
+                // TODO: resolve collision
+
+                switch(bonus.type)
+                {
+                case model::REPAIR_KIT:    score += repairBonus * pow(1 - durability, repairPower);  break;
+                case model::AMMO_CRATE:    ammoCount++;   break;
+                case model::NITRO_BOOST:   nitroCount++;  break;
+                case model::OIL_CANISTER:  oilCount++;    break;
+                case model::PURE_SCORE:    score += scoreBonus;  break;
+                default:  break;
+                }
+                score += pickupBonus;
+            }
+            if(time >= slidingEnd)for(auto &slick : tileMap.slicks[k])
+            {
+                if(!rect.checkPoint(slick.pos, slickRadius))continue;
+                slidingEnd = min(time + slidingTime, slick.endTime);
+                score -= slickPenalty;
+            }
         }
         return borderDist;
     }
@@ -508,7 +651,7 @@ struct CarState
         {
             curPower = 0;  frict = crossFrict;
         }
-        double brd = update(info, curPower, turn, frict);
+        double brd = update(info, time, curPower, turn, frict);
         if(brd < (time < 20 ? -epsDist : epsDist))return false;  // TODO: ~~~
         score -= distPenalty * pow(1 - dist / maxDist, distPower);
 
@@ -882,6 +1025,14 @@ Optimizer optimizer;
 
 
 
+void solveCollision(const RectInfo &info, const Vec2D &pos, Vec2D &spd, double &angSpd,
+    const RectInfo &info1, const Vec2D &pos1, const Vec2D &norm, const Vec2D &pt, double coeff)
+{
+    double w = (pt - pos) % norm, w1 = (pt - pos1) % norm;
+    double invEffMass = info.invMass + info1.invMass + w * w * info.invAngMass + w1 * w1 * info1.invAngMass;
+    double impulse = coeff / invEffMass;  spd += impulse * info.invMass * norm;  angSpd += impulse * info.invAngMass * w;
+}
+
 void MyStrategy::move(const model::Car &self, const model::World &world, const model::Game &game, model::Move &move)
 {
     if(globalTick != world.getTick())
@@ -892,7 +1043,7 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
             tileMap.init(world);
         }
 
-        // TODO
+        tileMap.reset(world);
     }
 
     if(globalTick < game.getInitialFreezeDurationTicks())
@@ -905,13 +1056,18 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
     optimizer.execute(move);
 
     /*
-    if(self.getDurability() < 0.999)exit(0);
-
     move.setEnginePower(1);
     move.setWheelTurn(globalTick < 570 ? 0 : 1);
     move.setBrake(globalTick >= 600 && globalTick < 620);
+    */
+
+    /*
+    move.setEnginePower(globalTick < 220 ? 1 : -1);
+    move.setWheelTurn(globalTick < 300 || globalTick >= 410 ? 0 : 0.1);
+    move.setBrake(globalTick >= 410);
 
     static double baseAngSpd;
+    static double predAngle, predAngSpd;
     static Vec2D predPos, predSpd;
 
     Vec2D pos(self.getX(), self.getY());
@@ -926,16 +1082,21 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
         cout << globalTick << ' ';
         //cout << pos.x << ' ' << pos.y << ' ';
         //cout << spd.x << ' ' << spd.y << ' ';
-        cout << errPos.len() << ' ' << errSpd.len() << endl;
+        //cout << errPos.x << ' ' << errPos.y << ' ';
+        cout << errSpd.x << ' ' << errSpd.y << ' ';
+        cout << errPos.len() << ' ' << errSpd.len() << ' ';
+        cout << (predAngle - angle) << ' ' << (predAngSpd - angSpd) << endl;
     }
+
+    if(self.getDurability() < 0.999)exit(0);
 
     double power = self.getEnginePower(), turn = self.getWheelTurn();
     power += limit(move.getEnginePower() - power, powerChange);
     turn += limit(move.getWheelTurn() - turn, turnChange);
-    if(move.isBrake())power = 0;
+    power *= power < 0 ? carInfo[self.getType()].carReverse : carInfo[self.getType()].carAccel;
+    if(move.isBrake())power = 0;  set<int> consumed;
 
-    Vec2D dir = sincos(angle);
-    Vec2D accel = carInfo[self.getType()].carAccel * power * dir;
+    Vec2D dir = sincos(angle), accel = power * dir;
     double frict = move.isBrake() ? crossFrict : longFrict;
     double rot = carRotFactor * turn * (spd * dir);
     for(int i = 0; i < physIter; i++)
@@ -943,8 +1104,53 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
         pos += spd * physDt;  spd += accel;  spd *= frictMul;
         spd -= limit(spd * dir, frict) * dir + limit(spd % dir, crossFrict) * ~dir;
         dir = sincos(angle += rot + angSpd * physDt);  angSpd *= rotFrictMul;
+
+        double dist = tileMap.borderDist(pos, dir, carHalfWidth, carHalfHeight);
+        if(dist < 0)
+        {
+            cout << "Border collision: " << -dist << endl;
+        }
+
+        Vec2D offs = pos * invTileSize;
+        int k = int(offs.y) * mapLine + int(offs.x);
+        for(auto &bonus : tileMap.bonuses[k])if(consumed.find(bonus.index) == consumed.end())
+        {
+            Vec2D norm, pt;
+            double depth = bonus.collide(Quad(pos, dir, carHalfWidth, carHalfHeight), norm, pt);
+            if(depth < 0)continue;  consumed.insert(bonus.index);
+
+            cout << "Bonus collision: " << depth << ' ';
+            cout << norm.x << ' ' << norm.y << ' ';
+            cout << pt.x << ' ' << pt.y << endl;
+
+            Vec2D v = spd + (rot * physIter + angSpd) * ~(pt - pos);  if(v * norm > 0)continue;
+            solveCollision(carInfo[self.getType()], pos, spd, angSpd,
+                bonusInfo, bonus.pos, norm, pt, -1.5 * (v * norm));
+            solveCollision(carInfo[self.getType()], pos, spd, angSpd,
+                bonusInfo, bonus.pos, ~norm, pt, sqrt(2.0 * 0.25) * (v * norm) * (v % norm) / v.len());
+        }
+
+        if(!consumed.size())for(auto &car : world.getCars())if(!car.isTeammate())
+        {
+            Vec2D norm, pt;  Quad rect(car);
+            double depth = rect.collide(Quad(pos, dir, carHalfWidth, carHalfHeight), norm, pt);
+            if(depth < 0)continue;  consumed.insert(-1);
+
+            cout << "Car collision: " << depth << ' ';
+            cout << norm.x << ' ' << norm.y << ' ';
+            cout << pt.x << ' ' << pt.y << endl;
+
+            Vec2D v = spd + (rot * physIter + angSpd) * ~(pt - pos);  if(v * norm > 0)continue;
+            solveCollision(carInfo[self.getType()], pos, spd, angSpd,
+                carInfo[car.getType()], rect.pos, norm, pt, -1.25 * (v * norm));
+            solveCollision(carInfo[self.getType()], pos, spd, angSpd,
+                carInfo[car.getType()], rect.pos, ~norm, pt, sqrt(2.0) * 0.25 * (v * norm) * (v % norm) / v.len());
+            cout << ">>>>>>>>> " << v % norm << endl;
+        }
     }
-    baseAngSpd = rot * physIter;  predPos = pos;  predSpd = spd;
+    baseAngSpd = rot * physIter;
+    predAngle = angle;  predAngSpd = angSpd;
+    predPos = pos;  predSpd = spd;
     */
 }
 

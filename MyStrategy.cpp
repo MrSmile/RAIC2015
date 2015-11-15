@@ -1041,13 +1041,12 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
 {
     if(globalTick != world.getTick())
     {
-        if(!(globalTick = world.getTick()))
+        if(globalTick < 0)
         {
             initConsts(game, world);  srand(game.getRandomSeed());
             tileMap.init(world);
         }
-
-        tileMap.reset(world);
+        globalTick = world.getTick();  tileMap.reset(world);
     }
 
     if(globalTick < game.getInitialFreezeDurationTicks())

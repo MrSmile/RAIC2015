@@ -996,7 +996,39 @@ struct Optimizer
         }
     }
 
-    void execute(model::Move &move)
+    void executeFallback(const model::Car &car, model::Move &move)
+    {
+        Vec2D pos(car.getX(), car.getY()), dir = sincos(car.getAngle());
+        Vec2D spd(car.getSpeedX(), car.getSpeedY());
+
+        Vec2D offs = pos * invTileSize;
+        int x = int(offs.x), y = int(offs.y), k = y * mapLine + x;
+        const vector<unsigned> &map = tileMap.distMap[nextWaypoint];  // TODO: waypoint
+
+        unsigned dist = map[k];  Vec2D target;
+        const int line = 2 * mapLine;  int p = 2 * k + line + 2;
+        if(!tileMap.borders[p -    1] && map[k -       1] < dist)target = {-1, 0};
+        if(!tileMap.borders[p +    1] && map[k +       1] < dist)target = {+1, 0};
+        if(!tileMap.borders[p - line] && map[k - mapLine] < dist)target = {0, -1};
+        if(!tileMap.borders[p +    0] && map[k + mapLine] < dist)target = {0, +1};
+
+        offs -= Vec2D(x + 0.5, y + 0.5);
+        constexpr double forward = sqrt(0.5), turnCoeff = sqrt(0.5);
+        if(dir * target > forward)
+        {
+            move.setEnginePower(1);
+            move.setWheelTurn(turnCoeff * ((dir + offs) % target));
+            move.setBrake(spd * target < 0);  return;
+        }
+
+        double shift = offs % target, spdProj = spd % target;
+        bool flag = signbit(abs(shift) < 0.15 ? spdProj : -shift);
+        move.setEnginePower(flag == signbit(dir % target) ? 1 : -1);
+        move.setBrake((flag ? spdProj : -spdProj) > 0.1);
+        move.setWheelTurn(flag ? -1 : 1);
+    }
+
+    void execute(const model::Car &car, model::Move &move)
     {
         Plan *sel = nullptr;
         double score = -numeric_limits<double>::infinity();
@@ -1016,10 +1048,7 @@ struct Optimizer
 #ifdef PRINT_LOG
             cout << "Path: NOT FOUND!!!" << endl;
 #endif
-            move.setEnginePower(-1);
-            move.setWheelTurn(2 * ((globalTick >> 8) & 1) - 1);
-            move.setUseNitro(false);  move.setBrake(false);
-            old = Plan();
+            executeFallback(car, move);  old = Plan();
         }
         best.clear();  next.clear();
     }
@@ -1056,7 +1085,7 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
     else if(self.isFinishedTrack())return;
 
     optimizer.process(self);
-    optimizer.execute(move);
+    optimizer.execute(self, move);
 
     /*
     move.setEnginePower(1);

@@ -33,7 +33,7 @@ int RemoteProcessClient::readTeamSizeMessage() {
 
 void RemoteProcessClient::writeProtocolVersionMessage() {
     writeEnum<MessageType>(PROTOCOL_VERSION);
-    writeInt(1);
+    writeInt(2);
 }
 
 Game RemoteProcessClient::readGameContextMessage() {
@@ -161,6 +161,7 @@ Car RemoteProcessClient::readCar() {
     double durability = readDouble();
     double enginePower = readDouble();
     double wheelTurn = readDouble();
+    int nextWaypointIndex = readInt();
     int nextWaypointX = readInt();
     int nextWaypointY = readInt();
     bool finishedTrack = readBoolean();
@@ -168,7 +169,7 @@ Car RemoteProcessClient::readCar() {
     return Car(id, mass, x, y, speedX, speedY, angle, angularSpeed, width, height, playerId, teammateIndex, teammate,
             type, projectileCount, nitroChargeCount, oilCanisterCount, remainingProjectileCooldownTicks,
             remainingNitroCooldownTicks, remainingOilCooldownTicks, remainingNitroTicks, remainingOiledTicks,
-            durability, enginePower, wheelTurn, nextWaypointX, nextWaypointY, finishedTrack);
+            durability, enginePower, wheelTurn, nextWaypointIndex, nextWaypointX, nextWaypointY, finishedTrack);
 }
 
 void RemoteProcessClient::writeCar(const Car& car) {
@@ -199,6 +200,7 @@ void RemoteProcessClient::writeCar(const Car& car) {
     writeDouble(car.getDurability());
     writeDouble(car.getEnginePower());
     writeDouble(car.getWheelTurn());
+    writeInt(car.getNextWaypointIndex());
     writeInt(car.getNextWaypointX());
     writeInt(car.getNextWaypointY());
     writeBoolean(car.isFinishedTrack());
@@ -673,8 +675,10 @@ World RemoteProcessClient::readWorld() {
         mapName = readString();
     }
 
-    if (tilesXY.empty()) {
-        tilesXY = readEnumArray2D<TileType>();
+    vector<vector<model::TileType> > newTilesXY = readEnumArray2D<TileType>();
+
+    if (!newTilesXY.empty()) {
+        tilesXY = newTilesXY;
     }
 
     if (waypoints.empty()) {
@@ -845,7 +849,7 @@ int RemoteProcessClient::readInt() {
     vector<signed char> bytes = this->readBytes(INTEGER_SIZE_BYTES);
 
     if (this->isLittleEndianMachine() != LITTLE_ENDIAN_BYTE_ORDER) {
-        reverse(&bytes[0], &bytes[INTEGER_SIZE_BYTES - 1]);
+        reverse(bytes.begin(), bytes.end());
     }
 
     int value;
@@ -902,7 +906,7 @@ void RemoteProcessClient::writeInt(int value) {
     memcpy(&bytes[0], &value, INTEGER_SIZE_BYTES);
 
     if (this->isLittleEndianMachine() != LITTLE_ENDIAN_BYTE_ORDER) {
-        reverse(&bytes[0], &bytes[INTEGER_SIZE_BYTES - 1]);
+        reverse(bytes.begin(), bytes.end());
     }
 
     this->writeBytes(bytes);
@@ -930,7 +934,7 @@ long long RemoteProcessClient::readLong() {
     vector<signed char> bytes = this->readBytes(LONG_SIZE_BYTES);
 
     if (this->isLittleEndianMachine() != LITTLE_ENDIAN_BYTE_ORDER) {
-        reverse(&bytes[0], &bytes[LONG_SIZE_BYTES - 1]);
+        reverse(bytes.begin(), bytes.end());
     }
 
     long long value;
@@ -946,7 +950,7 @@ void RemoteProcessClient::writeLong(long long value) {
     memcpy(&bytes[0], &value, LONG_SIZE_BYTES);
 
     if (this->isLittleEndianMachine() != LITTLE_ENDIAN_BYTE_ORDER) {
-        reverse(&bytes[0], &bytes[LONG_SIZE_BYTES - 1]);
+        reverse(bytes.begin(), bytes.end());
     }
 
     this->writeBytes(bytes);

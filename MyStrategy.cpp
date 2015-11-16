@@ -209,7 +209,7 @@ double powerChange, invPowerChange, turnChange, invTurnChange;
 double bonusHalfSize;  RectInfo bonusInfo;
 double slickRadius;  int slidingTime;
 
-int globalTick = -1, nextWaypoint = 0;
+int globalTick = -1;
 
 void CarInfo::set(double mass, double power, double rear)
 {
@@ -379,10 +379,11 @@ struct TileMap
             f_d,        // TOP_HEADED_T
             f_u,        // BOTTOM_HEADED_T
             0,          // CROSSROADS
+            0,          // UNKNOWN
         };
 
         const vector<vector<model::TileType>> &map = world.getTilesXY();
-        for(int x = 0; x < mapWidth; x++)for(int y = 0; y < mapWidth; y++)
+        for(int x = 0; x < mapWidth; x++)for(int y = 0; y < mapHeight; y++)
         {
             int flags = tile[map[x][y]];
             int pos = (y + 1) * line + 2 * (x + 1);
@@ -393,7 +394,7 @@ struct TileMap
         }
 
         /*
-        for(int x = 0; x < mapWidth; x++)for(int y = 0; y < mapWidth; y++)
+        for(int x = 0; x < mapWidth; x++)for(int y = 0; y < mapHeight; y++)
         {
             int flags = 0;
             int pos = (y + 1) * line + 2 * (x + 1);
@@ -529,8 +530,8 @@ struct TileMap
         }
         if(flags & f_c)
         {
-            Vec2D d1(max(0.0, tileMargin - minX.x), max(0.0, tileMargin - minX.y));
-            Vec2D d2(max(0.0, tileMargin - minY.x), max(0.0, tileMargin - minY.y));
+            Vec2D d1(max(0.0, 2 * tileMargin - minX.x), max(0.0, 2 * tileMargin - minX.y));
+            Vec2D d2(max(0.0, 2 * tileMargin - minY.x), max(0.0, 2 * tileMargin - minY.y));
             dist = min(dist, tileMargin - sqrt(max(d1 * d1, d2 * d2)));
         }
         if(flags & f_r)
@@ -575,15 +576,8 @@ struct CarState
         power = car.getEnginePower();
         turn = car.getWheelTurn();
 
-        int &next = nextWaypoint;  // TODO
-        int kk = car.getNextWaypointY() * mapLine + car.getNextWaypointX();
-        while(tileMap.waypoints[next] != kk)
-            if(size_t(++next) >= tileMap.waypoints.size())next = 0;
-        waypoint = next;
-
-        Vec2D offs = pos * invTileSize;
-        int k = int(offs.y) * mapLine + int(offs.x);
-        base = dist = tileMap.waypointDistMap(waypoint)[k];
+        Vec2D offs = pos * invTileSize;  int k = int(offs.y) * mapLine + int(offs.x);
+        base = dist = tileMap.waypointDistMap(waypoint = car.getNextWaypointIndex())[k];
         consumed = 0;  score = 0;
     }
 
@@ -1003,7 +997,7 @@ struct Optimizer
 
         Vec2D offs = pos * invTileSize;
         int x = int(offs.x), y = int(offs.y), k = y * mapLine + x;
-        const vector<unsigned> &map = tileMap.distMap[nextWaypoint];  // TODO: waypoint
+        const vector<unsigned> &map = tileMap.distMap[car.getNextWaypointIndex()];
 
         unsigned dist = map[k];  Vec2D target;
         const int line = 2 * mapLine;  int p = 2 * k + line + 2;

@@ -183,6 +183,7 @@ constexpr double timeEps = 0.001;
 
 constexpr double tileBonus = 1000;
 constexpr double pickupBonus = 5;
+constexpr double nitroCost = 100;
 constexpr double scoreBonus = 500;
 constexpr int repairPower = 4;
 constexpr double repairBonus = 500;
@@ -689,7 +690,7 @@ struct CarState
                 {
                 case model::REPAIR_KIT:    score += repairBonus * pow(1 - durability, repairPower);  break;
                 case model::AMMO_CRATE:    ammoCount++;   break;
-                case model::NITRO_BOOST:   nitroCount++;  break;
+                case model::NITRO_BOOST:   score += nitroCost;  nitroCount++;  break;
                 case model::OIL_CANISTER:  oilCount++;    break;
                 case model::PURE_SCORE:    score += scoreBonus;  break;
                 default:  break;
@@ -709,7 +710,8 @@ struct CarState
     bool activateNitro(int time)
     {
         if(!nitroCount || time < nitroEnd + nitroCooldown)return false;
-        power = 1;  nitroEnd = time + nitroDuration;  nitroCount--;  return true;
+        power = 1;  nitroEnd = time + nitroDuration;  nitroCount--;
+        score -= nitroCost;  return true;
     }
 
     bool nextStep(const CarInfo &info, int time, int powerTarget, int turnTarget, bool brake)
@@ -769,221 +771,333 @@ struct CarState
 };
 
 
-struct Maneuver
+enum EventType
 {
-    int start, time1, time2, turn1, turn2;
+    e_accel, e_reverse, e_brake, e_unbrake, e_left, e_center, e_right,
+    e_nitro, e_end
 };
 
-template<typename T> void evaluatePath(const CarInfo &info, CarState &state, T &handler, const Maneuver &mnv, int time)
+struct Event
 {
-    int lim = mnv.start + mnvDuration;
-    while(time < lim)if(!state.nextStep(info, time++, 1, mnv.turn2, false))return;
-    CarState last = state;
+    int time;  EventType type;
 
-    int dist = state.distance();  lim += mnvTail;
-    do if(time >= lim || !state.nextStep(info, time++, 1, mnv.turn2, false))return;
-    while(dist >= state.distance());
-    handler.evaluate(mnv, last, time, state, dist = state.distance(), true);
+    Event() = default;
 
-    do if(time >= lim || !state.nextStep(info, time++, 1, mnv.turn2, false))return;
-    while(dist >= state.distance());
-    handler.evaluate(mnv, last, time, state, dist = state.distance(), false);
-}
-
-template<typename T> void generatePathsTail(const CarInfo &info, CarState state, T &handler, Maneuver &mnv)
-{
-    int brakeEnd = mnv.time2 + brakeTime;
-    if(brakeEnd >= mnv.start + mnvDuration)
+    Event(int time_, EventType type_) : time(time_), type(type_)
     {
-        CarState state1 = state;  int time = mnv.time2;  mnv.turn2 = mnv.turn1;
-        while(time < brakeEnd)if(!state1.nextStep(info, time++, 1, mnv.turn1, true))return;
-        evaluatePath(info, state1, handler, mnv, brakeEnd);
     }
-    int turnEnd = mnv.time2 + int(abs(state.turn) * invTurnChange + timeEps);  mnv.turn2 = 0;
-    if(turnEnd >= mnv.start + mnvDuration)
-    {
-        evaluatePath(info, state, handler, mnv, mnv.time2);  return;
-    }
-    int time = mnv.time2;
-    while(time < turnEnd)if(!state.nextStep(info, time++, 1, 0, false))return;
-    CarState state1 = state;  evaluatePath(info, state,  handler, mnv, turnEnd);
-    mnv.turn2 = -mnv.turn1;   evaluatePath(info, state1, handler, mnv, turnEnd);
-}
+};
 
-template<typename T> void generatePathsTurn(const CarInfo &info, CarState state, T &handler, Maneuver &mnv)
+enum CommandType
 {
-    int mnvEnd = mnv.start + mnvDuration, time = mnv.time1;
-    while(time < mnvEnd)
-    {
-        if(!state.nextStep(info, time++, 1, mnv.turn1, false))return;
-        if((time + 2 * globalTick) % optStep)continue;  mnv.time2 = time;
-        generatePathsTail(info, state, handler, mnv);
-    }
-    mnv.time2 = infTime;  mnv.turn2 = mnv.turn1;
-    evaluatePath(info, state, handler, mnv, mnvEnd);
-}
+    c_stop,   // end program
+    c_jump,   // relative jump to arg
+    c_fork,   // fork to arg
+    c_twait,  // wait arg ticks
+    c_rwait,  // random wait of 1 to arg ticks
+    c_cwait,  // wait for turn = 0, but at least arg ticks
+    c_exec,   // execute event type arg
+};
 
-template<typename T> void generatePaths(const CarInfo &info, CarState state, T &handler, int time)
+struct Command
 {
-    Maneuver mnv;  mnv.start = mnv.time1 = time;
-    int turnEnd = time + int(abs(state.turn) * invTurnChange + timeEps);
-    mnv.turn1 = signbit(state.turn) ? -1 : 1;  generatePathsTurn(info, state, handler, mnv);
-    while(time < turnEnd)if(!state.nextStep(info, time++, 1, 0, false))return;
+    CommandType cmd;  int arg;
+};
 
-    mnv.time1 = turnEnd;
-    if(turnEnd > mnv.start + optStep / 2)generatePathsTurn(info, state, handler, mnv);
-    mnv.turn1 = -mnv.turn1;  generatePathsTurn(info, state, handler, mnv);
-
-    int mnvEnd = mnv.start + mnvDuration;
-    while(time < mnvEnd)
-    {
-        if(!state.nextStep(info, time++, 1, 0, false))return;
-        if(time % optStep)continue;  mnv.time1 = time;
-        mnv.turn1 = -1;  generatePathsTurn(info, state, handler, mnv);
-        mnv.turn1 = +1;  generatePathsTurn(info, state, handler, mnv);
-    }
-    mnv.time1 = mnv.time2 = infTime;  mnv.turn1 = mnv.turn2 = 0;
-    evaluatePath(info, state, handler, mnv, mnvEnd);
-}
-
-
-struct Plan
+struct ProgramState
 {
-    enum EventType
-    {
-        e_accel, e_reverse, e_brake, e_unbrake, e_left, e_center, e_right,
-        e_nitro, e_end
-    };
-
     enum ToggleFlags
     {
         f_nitro = 1
     };
 
-    struct Event
+    vector<Event> events;
+    int prevPower, power;
+    bool prevBrake, brake;
+    int prevTurn, turn, turnEnd;
+    int turnEvent, flags;
+
+    void update(EventType type)
     {
-        int time;  EventType type;
-
-        Event() = default;
-
-        Event(int time_, EventType type_) : time(time_), type(type_)
+        switch(type)
         {
+        case e_accel:    power = +1;        return;
+        case e_reverse:  power = -1;        return;
+        case e_brake:    brake = true;      return;
+        case e_unbrake:  brake = false;     return;
+        case e_left:     turn = -1;         return;
+        case e_center:   turn =  0;         return;
+        case e_right:    turn = +1;         return;
+        case e_nitro:    flags |= f_nitro;  return;
+        default:         assert(false);     return;
         }
-    };
+    }
 
-    struct Position
+    bool dumpEvents(CarState &state, int time)
     {
-        int event, power, turn;  bool brake;
-
-        Position() : event(0), power(1), turn(0), brake(false)
+        if(prevPower != power)
         {
+            prevPower = power;  events.emplace_back(time, power < 0 ? e_reverse : e_accel);
         }
-
-        int update(EventType type)
+        if(prevBrake != brake)
         {
-            switch(type)
+            prevBrake = brake;  events.emplace_back(time, brake ? e_brake : e_unbrake);
+        }
+        if(turn)
+        {
+            if(prevTurn == -turn || time > turnEnd)
             {
-            case e_accel:    power = +1;     return 0;
-            case e_reverse:  power = -1;     return 0;
-            case e_brake:    brake = true;   return 0;
-            case e_unbrake:  brake = false;  return 0;
-            case e_left:     turn = -1;      return 0;
-            case e_center:   turn =  0;      return 0;
-            case e_right:    turn = +1;      return 0;
-
-            case e_nitro:    return f_nitro;
-            default:         return 0;
+                turnEvent = events.size();
+                events.emplace_back(time, turn < 0 ? e_left : e_right);
             }
+            else events[turnEvent].type = turn < 0 ? e_left : e_right;
+            prevTurn = turn;  turnEnd = infTime;
         }
-    };
-
-    struct Manager
-    {
-        vector<Event> &events;
-        Position prev, next;
-        int time, flags;
-
-        Manager(vector<Event> &events_) : events(events_), time(0), flags(0)
+        else if(turnEnd == infTime)
         {
-            events.clear();
-        }
-
-        void execute(model::Move &move)
-        {
-            move.setEnginePower(next.power);  move.setWheelTurn(next.turn);
-            move.setBrake(next.brake);  move.setUseNitro(flags & f_nitro);
-            prev = Position();  flags = 0;
-        }
-
-        void dumpEvents(int nextTime)
-        {
-            if(time >= nextTime)return;
-
-            constexpr EventType turns[] = {e_left, e_center, e_right};
-            if(prev.power != next.power)events.emplace_back(time, next.power < 0 ? e_reverse : e_accel);
-            if(prev.brake != next.brake)events.emplace_back(time, next.brake ? e_brake : e_unbrake);
-            if(prev.turn != next.turn)events.emplace_back(time, turns[next.turn + 1]);
-            if(flags & f_nitro)events.emplace_back(time, e_nitro);
-
-            prev = next;  time = nextTime;  flags = 0;
-        }
-
-        void append(int eventTime, EventType type)
-        {
-            dumpEvents(eventTime);  flags |= next.update(type);
-        }
-
-        void append(const Maneuver &mnv)
-        {
-            dumpEvents(mnv.start);  next = Position();
-            if(mnv.time1 >= infTime)return;  dumpEvents(mnv.time1);  next.turn = mnv.turn1;
-            if(mnv.time2 >= infTime)return;  dumpEvents(mnv.time2);
-            if(mnv.turn2 == mnv.turn1)  // brake
+            if((prevTurn < 0 ? -state.turn : state.turn) > turnChange * timeEps)
             {
-                next.brake = true;  dumpEvents(mnv.time2 + brakeTime);  next.brake = false;
+                prevTurn = -prevTurn;  turnEvent = events.size();
+                events.emplace_back(time, e_center);
             }
-            else next.turn = mnv.turn2;
+            else events[turnEvent].type = e_center;
+            turnEnd = time + int(abs(state.turn) * invTurnChange + timeEps);
         }
-
-        void finalize()
+        if(flags & f_nitro)
         {
-            dumpEvents(infTime);  events.emplace_back(infTime, e_end);
+            if(!state.activateNitro(time))return false;
+            events.emplace_back(time, e_nitro);
         }
-    };
+        flags = 0;  return true;
+    }
 
+    bool nextStep(const CarInfo &info, CarState &state, int time) const
+    {
+        return state.nextStep(info, time, power, turn, brake);
+    }
+
+    bool init(const CarInfo &info, CarState &state, const vector<Event> &base, int time, int endTime)
+    {
+        events.clear();  power = 1;  brake = false;  turn = 0;  turnEvent = -1;  int pos = 0;
+        for(flags = 0; base[pos].time < time; pos++)
+        {
+            update(base[pos].type);
+            if(base[pos].type >= e_left && base[pos].type <= e_right)turnEvent = pos;
+            events.push_back(base[pos]);
+        }
+        while(time < endTime)
+        {
+            for(flags = 0; base[pos].time <= time; pos++)
+            {
+                update(base[pos].type);
+                if(base[pos].type >= e_left && base[pos].type <= e_right)turnEvent = pos;
+                events.push_back(base[pos]);
+            }
+            if((flags & f_nitro) && !state.activateNitro(time))return false;
+            if(!nextStep(info, state, time++))return false;
+        }
+        prevPower = power;  prevBrake = brake;
+        if(turn)
+        {
+            prevTurn = turn;  turnEnd = infTime;
+        }
+        else if(turnEvent < 0)
+        {
+            prevTurn = 0;  turnEvent = pos;
+            events.emplace_back(turnEnd = time, e_center);
+        }
+        else
+        {
+            prevTurn = signbit(state.turn) ? 1 : -1;
+            turnEnd = time + int(abs(state.turn) * invTurnChange + timeEps);
+        }
+        flags = 0;  return true;
+    }
+
+    bool process(const CarInfo &info, CarState &state, int &time, int endTime)
+    {
+        if(time >= endTime)return true;  if(!dumpEvents(state, time))return false;
+        while(time < endTime)if(!nextStep(info, state, time++))return false;
+        return true;
+    }
+
+    void finalize()
+    {
+        events.emplace_back(infTime, e_end);
+    }
+
+    void execute(const vector<Event> &base, model::Move &move)
+    {
+        power = 1;  brake = false;  turn = 0;  int pos = 0;
+        for(flags = 0; base[pos].time <= 0; pos++)update(base[pos].type);
+        move.setEnginePower(power);  move.setWheelTurn(turn);
+        move.setBrake(brake);  move.setUseNitro(flags & f_nitro);
+
+        events.clear();
+        for(flags = 0; base[pos].time <= 1; pos++)update(base[pos].type);
+        events.emplace_back(0, EventType(e_center + turn));
+        if(flags & f_nitro)events.emplace_back(0, e_nitro);
+        else if(power < 0)events.emplace_back(0, e_reverse);
+        if(brake)events.emplace_back(0, e_brake);
+
+        for(; base[pos].time < infTime; pos++)events.emplace_back(base[pos].time - 1, base[pos].type);
+        events.emplace_back(infTime, e_end);
+    }
+};
+
+template<typename T> void executeProgram(T &handler, const Command *program,
+    const CarInfo &info, CarState state, ProgramState cur, int time, int endTime)
+{
+    while(time < endTime)
+    {
+        switch(program->cmd)
+        {
+        case c_stop:
+            if(!cur.process(info, state, time, endTime))return;  break;
+
+        case c_jump:
+            assert(program->arg);  program += program->arg;  continue;
+
+        case c_fork:
+            assert(program->arg);
+            executeProgram(handler, program + program->arg, info, state, cur, time, endTime);
+            program++;  continue;
+
+        case c_exec:
+            cur.update(EventType(program->arg));
+            program++;  continue;
+
+        case c_twait:
+            assert(program->arg > 0);
+            if(!cur.process(info, state, time, min(endTime, time + program->arg)))return;
+            program++;  continue;
+
+        case c_rwait:
+            assert(program->arg > 0);
+            if(!cur.process(info, state, time, min(endTime, time + rand() % program->arg + 1)))return;
+            program++;  continue;
+
+        case c_cwait:
+            if(!cur.process(info, state, time,
+                min(endTime, time + max(program->arg, int(abs(state.turn) * invTurnChange + timeEps)))))return;
+            program++;  continue;
+
+        default:
+            assert(false);  return;
+        }
+        break;
+    }
+    assert(time == endTime);  cur.finalize();
+    handler.evaluate(info, state, cur, time);
+}
+
+
+constexpr Command program[] =
+{
+    {c_fork, +39},  // back
+    {c_fork, +10},  // left
+    {c_fork, +21},  // right
+    //{c_cwait, 1},
+    {c_rwait, optStep},
+
+    {c_fork, +5},   // nitro
+    {c_fork, +6},   // left
+    {c_fork, +17},  // right
+    {c_twait, optStep},
+    {c_jump, -4},
+
+    // nitro
+    {c_exec, e_nitro},
+    {c_stop, 0},
+
+    // left
+    {c_exec, e_left},
+    {c_rwait, optStep},
+    {c_fork, +4},   // left-center
+    {c_fork, +21},  // brake
+    {c_twait, optStep},
+    {c_jump, -3},
+
+    // left-center
+    {c_exec, e_center},
+    {c_cwait, 0},
+    {c_fork, +2},   // left-right
+    {c_stop,  0},
+
+    // left-right
+    {c_exec, e_right},
+    {c_stop, 0},
+
+    // right
+    {c_exec, e_right},
+    {c_rwait, optStep},
+    {c_fork, +4},   // right-center
+    {c_fork, +9},   // brake
+    {c_twait, optStep},
+    {c_jump, -3},
+
+    // right-center
+    {c_exec, e_right},
+    {c_cwait, 0},
+    {c_fork, +2},   // right-left
+    {c_stop, 0},
+
+    // right-left
+    {c_exec, e_left},
+    {c_stop, 0},
+
+    // brake
+    {c_exec, e_brake},
+    {c_twait, brakeTime},
+    {c_exec, e_unbrake},
+    {c_stop, 0},
+
+    // back
+    {c_exec, e_reverse},
+    {c_fork, +6},   // back-right
+
+    // back-left
+    {c_exec, e_left},
+    {c_rwait, optStep},
+    {c_fork, +8},   // end-back
+    {c_twait, optStep},
+    {c_jump, -2},
+
+    // back-right
+    {c_exec, e_right},
+    {c_rwait, optStep},
+    {c_fork, +3},   // end-back
+    {c_twait, optStep},
+    {c_jump, -2},
+
+    // end-back
+    {c_exec, e_center},
+    {c_exec, e_accel},
+    {c_stop, 0},
+};
+
+
+struct Plan
+{
     vector<Event> events;
     CarState last;
     double score;
 
     Plan() : score(-numeric_limits<double>::infinity())
     {
+        events.emplace_back(0, e_center);
         events.emplace_back(infTime, e_end);
     }
 
-    void set(const Plan *prev, const Maneuver &mnv, const CarState &last_, double score_)
+    void set(const vector<Event> &events_, const CarState &last_, double score_)
     {
-        Manager mng(events);
-        if(prev)for(const auto &evt : prev->events)
-            if(evt.time < mnv.start)mng.append(evt.time, evt.type);
-            else break;
-
-        mng.append(mnv);  mng.finalize();
-        last = last_;  score = score_;
-    }
-
-    bool nextStep(const CarInfo &info, CarState &state, Position &pos, int time) const
-    {
-        int flags = 0;
-        for(; events[pos.event].time <= time; pos.event++)
-            flags |= pos.update(events[pos.event].type);
-        if(flags & f_nitro)state.activateNitro(time);
-        return state.nextStep(info, time, pos.power, pos.turn, pos.brake);
+        events = events_;  last = last_;  score = score_;
     }
 
     void print() const
     {
         cout << "Path: ";
-        constexpr char flags[] = "arbulcrn";
+        constexpr char flags[] = "adbulcrn";
         for(const auto &evt : events)
             if(evt.type < e_end)cout << evt.time << flags[evt.type] << ' ';
             else break;
@@ -992,45 +1106,18 @@ struct Plan
 
     void execute(model::Move &move)
     {
-        vector<Event> old;  swap(old, events);
-
-        Manager mng(events);  int pos = 0;
-        for(; old[pos].time <= 0; pos++)
-            mng.append(0, old[pos].type);
-        mng.execute(move);
-
-        for(; old[pos].time < infTime; pos++)
-            mng.append(old[pos].time - 1, old[pos].type);
-        mng.finalize();
+        ProgramState cur;
+        cur.execute(events, move);
+        swap(events, cur.events);
     }
 };
 
 struct Optimizer
 {
-    Plan old, *current;  int bestDist;
+    Plan old;  int bestDist;
     unordered_map<int, Plan> prev, best, next;
 
-    void reset(const CarInfo &info, Plan::Position &pos, int time)
-    {
-        bestDist = 0;  int lim = time + mnvDuration;
-        while(time < lim)if(!old.nextStep(info, old.last, pos, time++))return;
-        CarState state = old.last;  current = &old;
-
-        Maneuver mnv;
-        mnv.start = mnv.time1 = lim;  mnv.turn1 = pos.turn;
-        mnv.time2 = infTime;  mnv.turn2 = 0;
-
-        int dist = state.distance();  lim += mnvTail;
-        do if(time >= lim || !state.nextStep(info, time++, 1, mnv.turn2, false))return;
-        while(dist >= state.distance());
-        evaluate(mnv, old.last, time, state, dist = state.distance(), true);
-
-        do if(time >= lim || !state.nextStep(info, time++, 1, mnv.turn2, false))return;
-        while(dist >= state.distance());
-        evaluate(mnv, old.last, time, state, dist = state.distance(), false);
-    }
-
-    void evaluate(const Maneuver &mnv, const CarState &last, int time, const CarState &state, int dist, bool main)
+    void evaluate(const vector<Event> &events, const CarState &last, const CarState &state, int time, int dist, bool main)
     {
         if(dist < bestDist)return;
         if(main && dist > bestDist)
@@ -1041,9 +1128,28 @@ struct Optimizer
         }
 
         double score = state.score - time;
-        unordered_map<int, Plan> &cur = dist > bestDist ? next : best;
-        Plan &track = cur[state.classify() & ~0x80];  if(!(score > track.score))return;
-        track.set(current, mnv, last, score);
+        Plan &track = (dist > bestDist ? next : best)[state.classify() & ~0x80];
+        if(score > track.score)track.set(events, last, score);
+    }
+
+    void evaluate(const CarInfo &info, const CarState &state, const ProgramState &cur, int time)
+    {
+        CarState tail = state;
+        int dist = tail.distance(), lim = time + mnvTail;
+        do if(time >= lim || !cur.nextStep(info, tail, time++))return;
+        while(dist >= tail.distance());
+        evaluate(cur.events, state, tail, time, dist = tail.distance(), true);
+
+        do if(time >= lim || !cur.nextStep(info, tail, time++))return;
+        while(dist >= tail.distance());
+        evaluate(cur.events, state, tail, time, dist = tail.distance(), false);
+    }
+
+    void reset(const CarInfo &info, int time)
+    {
+        ProgramState cur;  bestDist = 0;
+        if(!cur.init(info, old.last, old.events, time, time + mnvDuration))return;
+        cur.finalize();  evaluate(info, old.last, cur, time);
     }
 
     void process(const model::Car &car)
@@ -1051,17 +1157,21 @@ struct Optimizer
         assert(!prev.size() && !best.size() && !next.size());
 
         const CarInfo &info = carInfo[car.getType()];
-        CarState state(car);  old.last = state;  Plan::Position pos;
-        reset(info, pos, 0);  current = nullptr;
-        generatePaths(info, state, *this, 0);
+        CarState state(car);  old.last = state;  reset(info, 0);
 
-        for(int i = 1; i < stageCount; i++)
+        ProgramState cur;
+        if(cur.init(info, state, {Event(infTime, e_end)}, 0, 0))
+            executeProgram(*this, program, info, state, cur, 0, mnvDuration);
+
+        double time = mnvDuration;
+        for(int i = 1; i < stageCount; i++, time += mnvDuration)
         {
-            swap(prev, best);  next.clear();  reset(info, pos, i * mnvDuration);
-            for(auto &track : prev)
+            swap(prev, best);  next.clear();  reset(info, time);
+            for(auto &item : prev)
             {
-                current = &track.second;
-                generatePaths(info, current->last, *this, i * mnvDuration);
+                ProgramState cur;  auto &track = item.second;
+                if(cur.init(info, track.last, track.events, time, time))
+                    executeProgram(*this, program, info, track.last, cur, time, time + mnvDuration);
             }
             if(!best.size())
             {

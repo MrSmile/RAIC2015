@@ -43,6 +43,16 @@ inline double limit(double val, double lim)
     return max(-lim, min(lim, val));
 }
 
+template<unsigned n> constexpr double pow(double val)
+{
+    return n & 1 ? sqr(pow<(n >> 1)>(val)) * val : sqr(pow<(n >> 1)>(val));
+}
+template<> constexpr double pow<1>(double val)
+{
+    return val;
+}
+
+
 
 struct Vec2D
 {
@@ -176,27 +186,35 @@ struct CarInfo : public RectInfo
 };
 
 
-constexpr int distPower = 4;
-constexpr double distPenalty = 10;
-constexpr double maxDist = 32, epsDist = 1;
+constexpr double maxDist = 30;
 constexpr double timeEps = 0.001;
+constexpr double spdEps2 = 1e-12;
 
-constexpr double tileBonus = 1000;
-constexpr double pickupBonus = 5;
-constexpr double nitroCost = 100;
+constexpr double tileToggle = 0.49;
+constexpr double tileScore = 1000;
+
+constexpr double pickupScore = 5;
+constexpr double nitroCost = 50;
 constexpr double scoreBonus = 500;
 constexpr int repairPower = 4;
-constexpr double repairBonus = 500;
+constexpr double repairScore = 500;
 constexpr double slickPenalty = 5000;
-constexpr double maxBlowSpeed = 5;
-constexpr double pickupSpeed = 1;
 
-constexpr int optStep = 16, brakeTime = 20;
-constexpr int mnvDuration = 64, mnvTail = 64, stageCount = 3;
+constexpr int distPower = 4;
+constexpr double distPenalty = 10;
+constexpr double reversePenalty = 10;
+constexpr double maxBlowSpeed = 3;
+constexpr double pickupDepth = 5;
+constexpr double pickupSpeed = 0;
+
+constexpr double largeSpeed = 30;
+
+constexpr int optStep = 20, brakeTime = 20;
+constexpr int mnvDuration = 50, mnvTail = 200, stageCount = 4;
 constexpr int infTime = numeric_limits<int>::max();
 
 
-constexpr int physIter = 10;
+constexpr int physIter = 1;
 constexpr double physDt = 1.0 / physIter;
 constexpr double carBounce = 1.25, carFrict = sqrt(0.125);
 constexpr double bonusBounce = 1.5, bonusFrict = sqrt(0.5);
@@ -232,7 +250,7 @@ void initConsts(const model::Game &game, const model::World &world)
     mapWidth = world.getWidth();  mapHeight = world.getHeight();  mapLine = mapWidth + 1;
 
     nitroDuration = game.getNitroDurationTicks();
-    nitroCooldown = game.getUseNitroCooldownTicks();
+    nitroCooldown = game.getUseNitroCooldownTicks() - nitroDuration;
     nitroPower = game.getNitroEnginePowerFactor();
 
     carHalfWidth = game.getCarWidth() / 2;
@@ -253,7 +271,7 @@ void initConsts(const model::Game &game, const model::World &world)
     powerChange = game.getCarEnginePowerChangePerTick();  invPowerChange = 1 / powerChange;
     turnChange = game.getCarWheelTurnChangePerTick();  invTurnChange = 1 / turnChange;
 
-    bonusHalfSize = game.getBonusSize() / 2;
+    bonusHalfSize = game.getBonusSize() / 2 - pickupDepth;
     bonusInfo.set(game.getBonusMass(), bonusHalfSize, bonusHalfSize);
 
     slickRadius = game.getOilSlickRadius();
@@ -661,7 +679,7 @@ struct CarState
                 if(normSpd < 0)
                 {
                     if(normSpd < -maxBlowSpeed)return false;
-                    double frictCoeff = carFrict * normSpd / relSpd.len();
+                    double frictCoeff = carFrict * normSpd / sqrt(relSpd.sqr() + spdEps2);
                     solveImpulse(info, pos, spd, angSpd, borderInfo, pt,  norm, pt, -carBounce * normSpd);
                     solveImpulse(info, pos, spd, angSpd, borderInfo, pt, ~norm, pt, frictCoeff * (relSpd % norm));
 
@@ -680,7 +698,7 @@ struct CarState
                 double normSpd = relSpd * norm;
                 if(normSpd < 0)
                 {
-                    double frictCoeff = bonusFrict * normSpd / relSpd.len();
+                    double frictCoeff = bonusFrict * normSpd / sqrt(relSpd.sqr() + spdEps2);
                     solveImpulse(info, pos, spd, angSpd, bonusInfo, bonus.pos,  norm, pt, -bonusBounce * normSpd);
                     solveImpulse(info, pos, spd, angSpd, bonusInfo, bonus.pos, ~norm, pt, frictCoeff * (relSpd % norm));
                 }
@@ -688,14 +706,14 @@ struct CarState
 
                 switch(bonus.type)
                 {
-                case model::REPAIR_KIT:    score += repairBonus * pow(1 - durability, repairPower);  break;
+                case model::REPAIR_KIT:    score += repairScore * pow<repairPower>(1 - durability);  break;
                 case model::AMMO_CRATE:    ammoCount++;   break;
                 case model::NITRO_BOOST:   score += nitroCost;  nitroCount++;  break;
                 case model::OIL_CANISTER:  oilCount++;    break;
                 case model::PURE_SCORE:    score += scoreBonus;  break;
                 default:  break;
                 }
-                score += pickupBonus;
+                score += pickupScore;
             }
             if(time >= slidingEnd)for(auto &slick : tileMap.slicks[k])
             {
@@ -704,7 +722,7 @@ struct CarState
                 score -= slickPenalty;
             }
         }
-        score -= distPenalty * pow(1 - max(0.0, borderDist) / maxDist, distPower);  return true;
+        score -= distPenalty * pow<distPower>(1 - max(0.0, borderDist) / maxDist);  return true;
     }
 
     bool activateNitro(int time)
@@ -730,21 +748,17 @@ struct CarState
             curPower = 0;  frict = crossFrict;
         }
         if(!update(info, time, curPower, turn, frict))return false;
+        if(powerTarget < 1)score -= reversePenalty;
 
         Vec2D offs = pos * invTileSize;
-        int k = int(offs.y) * mapLine + int(offs.x);
-        unsigned cur = tileMap.distMap[waypoint][k];
-        if(dist > cur)
-        {
-            dist = cur;  score += tileBonus;
-            if(!dist)
-            {
-                if(size_t(++waypoint) >= tileMap.waypoints.size())waypoint = 0;
-                int delta = tileMap.waypointDistMap(waypoint)[k];  // TODO: detect finish
-                base += delta;  dist += delta;
-            }
-        }
-        return true;
+        int x = int(offs.x), y = int(offs.y), k = y * mapLine + x;
+        if(abs(offs.x - x - 0.5) > tileToggle || abs(offs.y - y - 0.5) > tileToggle)return true;
+        unsigned cur = tileMap.distMap[waypoint][k];  if(dist <= cur)return true;
+        dist = cur;  score += tileScore;  if(dist)return true;
+
+        if(size_t(++waypoint) >= tileMap.waypoints.size())waypoint = 0;
+        int delta = tileMap.waypointDistMap(waypoint)[k];  // TODO: detect finish
+        base += delta;  dist += delta;  return true;
     }
 
     static int classify(Vec2D vec)
@@ -761,7 +775,8 @@ struct CarState
     int classify() const
     {
         Vec2D offs = pos * invTileSize;  int x = int(offs.x), y = int(offs.y);
-        return (y * mapLine + x) << 8 | classify(offs - Vec2D(x + 0.5, y + 0.5)) << 4 | classify(dir);
+        return (y * mapLine + x) << 9 | (spd.sqr() > sqr(largeSpeed) ? 1 << 8 : 0) |
+            classify(offs - Vec2D(x + 0.5, y + 0.5)) << 4 | classify(dir);
     }
 
     int distance() const
@@ -1054,25 +1069,34 @@ constexpr Command program[] =
 
     // back
     {c_exec, e_reverse},
-    {c_fork, +6},   // back-right
+    {c_fork, +11},  // back-right
 
     // back-left
     {c_exec, e_left},
+    {c_twait, 40},
     {c_rwait, optStep},
-    {c_fork, +8},   // end-back
+    {c_fork, +3},   // back-left-right
     {c_twait, optStep},
     {c_jump, -2},
+
+    // back-left-right
+    {c_exec, e_accel},
+    {c_twait, 20},
+    {c_exec, e_right},
+    {c_stop, 0},
 
     // back-right
     {c_exec, e_right},
+    {c_twait, 40},
     {c_rwait, optStep},
-    {c_fork, +3},   // end-back
+    {c_fork, +3},   // back-right-left
     {c_twait, optStep},
     {c_jump, -2},
 
-    // end-back
-    {c_exec, e_center},
+    // back-right-left
     {c_exec, e_accel},
+    {c_twait, 20},
+    {c_exec, e_left},
     {c_stop, 0},
 };
 
@@ -1114,8 +1138,12 @@ struct Plan
 
 struct Optimizer
 {
-    Plan old;  int bestDist;
+    Plan old;  int lastGood, bestDist;
     unordered_map<int, Plan> prev, best, next;
+
+    Optimizer() : lastGood(numeric_limits<int>::min())
+    {
+    }
 
     void evaluate(const vector<Event> &events, const CarState &last, const CarState &state, int time, int dist, bool main)
     {
@@ -1197,13 +1225,18 @@ struct Optimizer
         if(!tileMap.borders[p - line] && map[k - mapLine] < dist)target = {0, -1};
         if(!tileMap.borders[p +    0] && map[k + mapLine] < dist)target = {0, +1};
 
-        offs -= Vec2D(x + 0.5, y + 0.5);
+        offs -= Vec2D(x + 0.5, y + 0.5);  double dot = dir * target;
         constexpr double forward = sqrt(0.5), turnCoeff = sqrt(0.5);
-        if(dir * target > forward)
+        if(dot > forward)
         {
             move.setEnginePower(1);
             move.setWheelTurn(turnCoeff * ((dir + offs) % target));
             move.setBrake(spd * target < 0);  return;
+        }
+        else if(dot < -forward)
+        {
+            move.setEnginePower(-1);
+            move.setWheelTurn(signbit(offs % target) ? 1 : -1);  return;
         }
 
         double shift = offs % target, spdProj = spd % target;
@@ -1226,14 +1259,18 @@ struct Optimizer
 #ifdef PRINT_LOG
             sel->print();
 #endif
-            sel->execute(move);  swap(*sel, old);
+            sel->execute(move);  swap(*sel, old);  lastGood = globalTick;
         }
         else
         {
 #ifdef PRINT_LOG
             cout << "Path: NOT FOUND!!!" << endl;
 #endif
-            executeFallback(car, move);  old = Plan();
+            if(old.events.size() < 3 || globalTick > lastGood + 10)
+            {
+                executeFallback(car, move);  old = Plan();
+            }
+            else old.execute(move);
         }
         best.clear();  next.clear();
     }
@@ -1329,7 +1366,7 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
             double normSpd = relSpd * norm;
             if(normSpd < 0)
             {
-                double frictCoeff = carFrict * normSpd / relSpd.len();
+                double frictCoeff = carFrict * normSpd / sqrt(relSpd.sqr() + spdEps2);
                 solveImpulse(info, pos, spd, angSpd, borderInfo, pt,  norm, pt, -carBounce * normSpd);
                 solveImpulse(info, pos, spd, angSpd, borderInfo, pt, ~norm, pt, frictCoeff * (relSpd % norm));
             }
@@ -1351,7 +1388,7 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
             double normSpd = relSpd * norm;
             if(normSpd < 0)
             {
-                double frictCoeff = bonusFrict * normSpd / relSpd.len();
+                double frictCoeff = bonusFrict * normSpd / sqrt(relSpd.sqr() + spdEps2);
                 solveImpulse(info, pos, spd, angSpd, bonusInfo, bonus.pos,  norm, pt, -bonusBounce * normSpd);
                 solveImpulse(info, pos, spd, angSpd, bonusInfo, bonus.pos, ~norm, pt, frictCoeff * (relSpd % norm));
             }
@@ -1372,7 +1409,7 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
             double normSpd = relSpd * norm;
             if(normSpd < 0)
             {
-                double frictCoeff = carFrict * normSpd / relSpd.len();
+                double frictCoeff = carFrict * normSpd / sqrt(relSpd.sqr() + spdEps2);
                 solveImpulse(info, pos, spd, angSpd, carInfo[car.getType()], rect1.pos,  norm, pt, -carBounce * normSpd);
                 solveImpulse(info, pos, spd, angSpd, carInfo[car.getType()], rect1.pos, ~norm, pt, frictCoeff * (relSpd % norm));
             }

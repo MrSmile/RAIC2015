@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <limits>
-#include <set>
+#include <map>
 
 #include <iostream>  // DEBUG
 #include <iomanip>  // DEBUG
@@ -186,7 +186,7 @@ struct CarInfo : public RectInfo
 };
 
 
-constexpr double maxDist = 30;
+constexpr double maxDist = 16;
 constexpr double timeEps = 0.001;
 constexpr double spdEps2 = 1e-12;
 
@@ -198,10 +198,10 @@ constexpr double nitroCost = 100;
 constexpr double scoreBonus = 500;
 constexpr int repairPower = 4;
 constexpr double repairScore = 500;
-constexpr double slickPenalty = 5000;
+constexpr double slickPenalty = 1000;
 
 constexpr int distPower = 4;
-constexpr double distPenalty = 10;
+constexpr double distPenalty = 100;
 constexpr double reversePenalty = 10;
 constexpr double maxBlowSpeed = 3;
 constexpr double pickupDepth = 5;
@@ -209,8 +209,7 @@ constexpr double pickupSpeed = 0;
 
 constexpr double largeSpeed = 30;
 
-constexpr int optTileDist = 8;
-constexpr int optLookahead = 400, optStep = 20, brakeTime = 20;
+constexpr int optTileDist = 8, optLookahead = 600;
 constexpr int infTime = numeric_limits<int>::max();
 
 
@@ -706,7 +705,7 @@ struct CarState
 
                 switch(bonus.type)
                 {
-                case model::REPAIR_KIT:    score += repairScore * pow<repairPower>(1 - durability);  break;
+                case model::REPAIR_KIT:    score += repairScore * pow<repairPower>(1 - durability);  durability = 1;  break;
                 case model::AMMO_CRATE:    ammoCount++;   break;
                 case model::NITRO_BOOST:   score += nitroCost;  nitroCount++;  break;
                 case model::OIL_CANISTER:  oilCount++;    break;
@@ -1026,105 +1025,152 @@ template<typename T> void executeProgram(T &handler, const Command *program, int
 }
 
 
-const Command programData[] =
+namespace Program
 {
-    // program: left-center
-    {c_cwait, 1},
-    {c_fork, +24},  // right
-    {c_jump, +3},
+    struct Branch
+    {
+        CommandType cmd;
+        const char *label;
+    };
 
-    // program: right-center
-    {c_cwait, 1},
-    {c_fork, +9},   // left
+    struct Listing
+    {
+        vector<Command> data;
+        map<string, int> labels;
+        vector<int> targets;
 
-    // program: center
-    {c_rwait, optStep},
-    {c_fork, +5},   // nitro
-    {c_fork, +6},   // left
-    {c_fork, +17},  // right
-    {c_twait, optStep},
-    {c_jump, -4},
+        void append(const Command &cmd)
+        {
+            data.push_back(cmd);
+        }
 
-    // label: nitro
-    {c_exec, e_nitro},
-    {c_stop, 0},
+        void append(const Branch &cmd)
+        {
+            auto res = labels.insert(pair<string, int>(cmd.label, targets.size()));
+            if(res.second)targets.push_back(-1);  int pos = res.first->second;
+            if(cmd.cmd == c_stop)
+            {
+                assert(targets[pos] < 0);  targets[pos] = data.size();
+            }
+            else data.push_back({cmd.cmd, pos});
+        }
+    };
 
-    // label: left
-    {c_exec, e_left},
-    // program: left
-    {c_rwait, optStep},
-    {c_fork, +4},   // left-center
-    {c_fork, +21},  // brake
-    {c_twait, optStep},
-    {c_jump, -3},
+    Listing &&operator + (Listing &&program, const Command &cmd)
+    {
+        program.append(cmd);  return move(program);
+    }
 
-    // label: left-center
-    {c_exec, e_center},
-    {c_cwait, 0},
-    {c_fork, +2},   // left-right
-    {c_stop,  0},
+    Listing &&operator + (Listing &&program, const Branch &cmd)
+    {
+        program.append(cmd);  return move(program);
+    }
 
-    // label: left-right
-    {c_exec, e_right},
-    {c_stop, 0},
+    struct Bytecode
+    {
+        vector<Command> data;
+        map<string, int> labels;
 
-    // label: right
-    {c_exec, e_right},
-    // program: right
-    {c_rwait, optStep},
-    {c_fork, +4},   // right-center
-    {c_fork, +9},   // brake
-    {c_twait, optStep},
-    {c_jump, -3},
+        Bytecode(Listing &&program) : data(program.data), labels(program.labels)
+        {
+            for(auto &label : labels)
+            {
+                label.second = program.targets[label.second];  assert(label.second >= 0);
+            }
+            for(size_t i = 0; i < data.size(); i++)
+                if(data[i].cmd == c_jump || data[i].cmd == c_fork)
+                {
+                    data[i].arg = program.targets[data[i].arg] - i;
+                }
+        }
 
-    // label: right-center
-    {c_exec, e_right},
-    {c_cwait, 0},
-    {c_fork, +2},   // right-left
-    {c_stop, 0},
+        const Command *operator [] (const char *label) const
+        {
+            auto res = labels.find(label);  assert(res != labels.end());  return &data[res->second];
+        }
+    };
 
-    // label: right-left
-    {c_exec, e_left},
-    {c_stop, 0},
+    Listing start()
+    {
+        return Listing();
+    }
 
-    // label: brake
-    {c_exec, e_brake},
-    {c_twait, brakeTime},
-    {c_exec, e_unbrake},
-    {c_stop, 0},
+    constexpr Command stop()
+    {
+        return {c_stop, 0};
+    }
 
-    // program: back
-    //{c_exec, e_reverse},
-    {c_fork, +11},  // back-right
+    constexpr Branch jump(const char *label)
+    {
+        return {c_jump, label};
+    }
 
-    // label: back-left
-    {c_exec, e_left},
-    {c_twait, 40},
-    {c_rwait, optStep},
-    {c_fork, +3},   // back-left-right
-    {c_twait, optStep},
-    {c_jump, -2},
+    constexpr Branch fork(const char *label)
+    {
+        return {c_fork, label};
+    }
 
-    // label: back-left-right
-    {c_exec, e_accel},
-    {c_twait, 20},
-    {c_exec, e_right},
-    {c_stop, 0},
+    constexpr Command twait(int duration)
+    {
+        return {c_twait, duration};
+    }
 
-    // label: back-right
-    {c_exec, e_right},
-    {c_twait, 40},
-    {c_rwait, optStep},
-    {c_fork, +3},   // back-right-left
-    {c_twait, optStep},
-    {c_jump, -2},
+    constexpr Command rwait(int duration)
+    {
+        return {c_rwait, duration};
+    }
 
-    // label: back-right-left
-    {c_exec, e_accel},
-    {c_twait, 20},
-    {c_exec, e_left},
-    {c_stop, 0},
-};
+    constexpr Command cwait(int duration)
+    {
+        return {c_cwait, duration};
+    }
+
+    constexpr Command exec(EventType event)
+    {
+        return {c_exec, event};
+    }
+
+    Branch label(const char *label)
+    {
+        return {c_stop, label};
+    }
+
+
+    constexpr int optStep = 20, brakeTime = 20;
+
+    const Bytecode bytecode = start() +
+
+        label("> left-center") + cwait(1) + fork("right") + jump("> center") +
+        label("> right-center") + cwait(1) + fork("left") +
+        label("> center") + rwait(optStep) +
+        label("loop_c") + fork("nitro") + fork("left") + fork("right") + twait(optStep) + jump("loop_c") +
+        label("nitro") + exec(e_nitro) + stop() +
+
+        label("left") + exec(e_left) + label("> left") + rwait(optStep) +
+        label("loop_l") + fork("left-center") + fork("brake") + twait(optStep) + jump("loop_l") +
+        label("left-center") + exec(e_center) + cwait(0) + fork("left-right") + stop() +
+        label("left-right") + exec(e_right) + stop() +
+
+        label("right") + exec(e_right) + label("> right") + rwait(optStep) +
+        label("loop_r") + fork("right-center") + fork("brake") + twait(optStep) + jump("loop_r") +
+        label("right-center") + exec(e_right) + cwait(0) + fork("right-left") + stop() +
+        label("right-left") + exec(e_left) + stop() +
+
+        label("brake") + exec(e_brake) + twait(brakeTime) + exec(e_unbrake) + stop() +
+
+        label("> back") + rwait(optStep) +
+        label("loop_b") + fork("back-left") + fork("back-right") + twait(optStep) + jump("loop_b") +
+        label("back-left") + exec(e_left) + rwait(optStep) +
+        label("loop_blr") + fork("back-left-right") + twait(optStep) + jump("loop_blr") +
+        label("back-left-right") + exec(e_accel) + twait(30) + exec(e_right) + cwait(0) + fork("back-center") + stop() +
+        label("back-right") + exec(e_right) + rwait(optStep) +
+        label("loop_brl") + fork("back-right-left") + twait(optStep) + jump("loop_brl") +
+        label("back-right-left") + exec(e_accel) + twait(30) + exec(e_left) + cwait(0) + fork("back-center") + stop() +
+        label("back-center") + exec(e_accel) + exec(e_center) + stop();
+
+}  // namespace Program
+
+using Program::bytecode;
 
 enum ProgramType
 {
@@ -1133,9 +1179,11 @@ enum ProgramType
 
 const Command *const program[] =
 {
-    programData + 5, programData + 0, programData + 3, programData + 14, programData + 26, programData + 41
+    bytecode["> center"], bytecode["> left-center"], bytecode["> right-center"],
+    bytecode["> left"], bytecode["> right"], bytecode["> back"],
 };
-const int programDuration[] = {100, 100, 100, 100, 100, 100};
+
+const int programDuration[] = {100, 100, 100, 100, 100, 300};
 
 ProgramType classifyState(const CarState &state, const ProgramState &cur, int time)
 {
@@ -1206,7 +1254,7 @@ struct Optimizer
         void process(unordered_map<int, Plan> &best, const vector<Event> &events, int tileDist, int newLeafDist) const
         {
             if(time < 0)return;
-            Plan &track = best[state.classify() & ~0x80];  if(!(state.score > track.state.score))return;
+            Plan &track = best[state.classify()];  if(!(state.score > track.state.score))return;
             track.set(events, eventCount, state, time, tileDist, max(leafDist, newLeafDist));
         }
     };
@@ -1223,7 +1271,6 @@ struct Optimizer
 
     bool evaluate(const CarInfo &info, const CarState &state, const vector<Event> &events, int time)
     {
-        assert(state.dist == path.size());  // DEBUG
         assert(state.dist <= optTileDist);
         while(path.size() < state.dist)path.emplace_back();
         path.emplace_back(time, state, events.size());
@@ -1237,15 +1284,37 @@ struct Optimizer
         for(path.resize(pos + 1); pos >= 0; pos--, leafDist++)path[pos].leafDist = max(path[pos].leafDist, leafDist);
     }
 
+    void executeProgram(const CarInfo &info, ProgramState &cur, ProgramType type)
+    {
+        ::executeProgram(*this, program[type], info, path[0].state, cur, 0, programDuration[type]);
+    }
+
     void process(const model::Car &car)
     {
         const CarInfo &info = carInfo[car.getType()];
         best.clear();  path.clear();  path.emplace_back(0, car, 0);
         executePlan(*this, info, path[0].state, old.events, old.time);
+        for(auto &pos : path)pos.leafDist = 0;
 
         ProgramState cur(info, path[0].state, {Event(infTime, e_end)}, 0);
-        for(int type = 0; type < p_count; type++)
-            executeProgram(*this, program[type], info, path[0].state, cur, 0, programDuration[type]);
+        if(!cur.turnEnd)
+        {
+            cur.update(e_center);  executeProgram(info, cur, p_center);
+            cur.update(e_left);    executeProgram(info, cur, p_left);
+            cur.update(e_right);   executeProgram(info, cur, p_right);
+        }
+        else if(cur.prevTurn < 0)
+        {
+            cur.update(e_center);  executeProgram(info, cur, p_left_center);
+            cur.update(e_left);    executeProgram(info, cur, p_left);
+        }
+        else
+        {
+            cur.update(e_center);  executeProgram(info, cur, p_right_center);
+            cur.update(e_right);   executeProgram(info, cur, p_right);
+        }
+        cur.update(e_center);  cur.update(e_reverse);
+        executeProgram(info, cur, p_back);
 
         for(;;)
         {
@@ -1261,7 +1330,7 @@ struct Optimizer
                 path.emplace_back(track.time, track.state, track.events.size());
                 ProgramState cur(info, track.state, move(track.events), track.time);
                 ProgramType type = classifyState(track.state, cur, track.time);
-                executeProgram(*this, program[type], info,
+                ::executeProgram(*this, program[type], info,
                     track.state, cur, track.time, track.time + programDuration[type]);
             }
         }

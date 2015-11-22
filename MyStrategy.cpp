@@ -1,6 +1,7 @@
 #include "MyStrategy.h"
 
 #include <cmath>
+#include <memory>
 #include <cstdlib>
 #include <cassert>
 #include <algorithm>
@@ -194,7 +195,7 @@ constexpr double tileToggle = 0.49;
 constexpr double tileScore = 1000;
 
 constexpr double pickupScore = 5;
-constexpr double nitroCost = 100;
+constexpr double nitroCost = 50;
 constexpr double scoreBonus = 500;
 constexpr int repairPower = 4;
 constexpr double repairScore = 500;
@@ -721,7 +722,8 @@ struct CarState
                 score -= slickPenalty;
             }
         }
-        score -= distPenalty * pow<distPower>(1 - max(0.0, borderDist) / maxDist);  return true;
+        score -= distPenalty * pow<distPower>(1 - max(0.0, borderDist) / maxDist);
+        score--;  return true;
     }
 
     bool activateNitro(int time)
@@ -1194,27 +1196,41 @@ ProgramType classifyState(const CarState &state, const ProgramState &cur, int ti
 }
 
 
+struct Position
+{
+    int time, leafDist;
+    shared_ptr<Position> prev;
+    CarState state;
+    int eventCount;
+
+    Position(shared_ptr<Position> &&prev_, int time_, const CarState &state_, int eventCount_) :
+        time(time_), leafDist(0), prev(prev_), state(state_), eventCount(eventCount_)
+    {
+    }
+};
+
 struct Plan
 {
     int time, tileDist, leafDist;
+    shared_ptr<Position> last;
     vector<Event> events;
-    CarState state;
+    double score;
 
-    Plan()
+    Plan() : time(0), tileDist(0), leafDist(0), score(-numeric_limits<double>::infinity())
     {
-        time = 0;  leafDist = 0;
         events.emplace_back(0, e_center);
         events.emplace_back(infTime, e_end);
-        state.score = -numeric_limits<double>::infinity();
     }
 
-    void set(const vector<Event> &base, int eventCount, const CarState &state_, int time_, int tileDist_, int leafDist_)
+    void set(const vector<Event> &base, const shared_ptr<Position> &pos)
     {
-        events.clear();  events.reserve(eventCount + 1);
-        events.insert(events.begin(), base.begin(), base.end());
-        events.emplace_back(infTime, e_end);
+        last = pos;  time = pos->time;
+        tileDist = pos->state.dist;  leafDist = pos->leafDist;
+        score = pos->state.score;
 
-        state = state_;  time = time_;  tileDist = tileDist_;  leafDist = leafDist_;
+        events.clear();  events.reserve(pos->eventCount + 1);
+        events.insert(events.begin(), base.begin(), base.begin() + pos->eventCount);
+        events.emplace_back(infTime, e_end);
     }
 
     void print() const
@@ -1224,79 +1240,65 @@ struct Plan
         for(const auto &evt : events)
             if(evt.type < e_end)cout << evt.time << flags[evt.type] << ' ';
             else break;
-        cout << "| " << state.score << endl;
+        cout << "| " << score << endl;
     }
 
     void execute(model::Move &move)
     {
-        Move::execute(events, move);
+        Move::execute(events, move);  last.reset();
     }
 };
 
 struct Optimizer
 {
-    struct Position
-    {
-        int time, leafDist;
-        CarState state;
-        int eventCount;
-
-        Position() : time(-1), leafDist(0)
-        {
-        }
-
-        Position(int time_, const CarState &state_, int eventCount_) :
-            time(time_), leafDist(0), state(state_), eventCount(eventCount_)
-        {
-            state.score -= time;
-        }
-
-        void process(unordered_map<int, Plan> &best, const vector<Event> &events, int tileDist, int newLeafDist) const
-        {
-            if(time < 0)return;
-            Plan &track = best[state.classify()];  if(!(state.score > track.state.score))return;
-            track.set(events, eventCount, state, time, tileDist, max(leafDist, newLeafDist));
-        }
-    };
-
     Plan old;  int lastGood;
     unordered_map<int, Plan> best;
-    vector<Position> path;
+    shared_ptr<Position> last;
+    int startLeafDist;
     vector<Plan> buf;
 
     Optimizer() : lastGood(numeric_limits<int>::min())
     {
-        path.reserve(optTileDist + 1);
     }
 
     bool evaluate(const CarInfo &info, const CarState &state, const vector<Event> &events, int time)
     {
         assert(state.dist <= optTileDist);
-        while(path.size() < state.dist)path.emplace_back();
-        path.emplace_back(time, state, events.size());
+        last = make_shared<Position>(move(last), time, state, events.size());
         return state.dist < optTileDist;
     }
 
     void finalize(const vector<Event> &events, int startTime, int endTime, bool completed)
     {
-        int pos = path.size() - 1, leafDist = 0;
-        for(; path[pos].time > startTime; pos--, leafDist++)path[pos].process(best, events, pos, leafDist);
-        for(path.resize(pos + 1); pos >= 0; pos--, leafDist++)path[pos].leafDist = max(path[pos].leafDist, leafDist);
+        auto pos = &last;  int leafDist = startLeafDist;
+        for(; (*pos)->time > startTime; pos = &(*pos)->prev, leafDist++)
+        {
+            (*pos)->leafDist = max(leafDist, (*pos)->leafDist);
+
+            Plan &track = best[(*pos)->state.classify()];
+            if((*pos)->state.score > track.score)track.set(events, *pos);
+        }
+        last = *pos;  pos = &last;
+        for(; (*pos); pos = &(*pos)->prev, leafDist++)
+            (*pos)->leafDist = max(leafDist, (*pos)->leafDist);
     }
 
     void executeProgram(const CarInfo &info, ProgramState &cur, ProgramType type)
     {
-        ::executeProgram(*this, program[type], info, path[0].state, cur, 0, programDuration[type]);
+        assert(last && !last->time);
+        ::executeProgram(*this, program[type], info, last->state, cur, 0, programDuration[type]);
     }
 
     void process(const model::Car &car)
     {
         const CarInfo &info = carInfo[car.getType()];
-        best.clear();  path.clear();  path.emplace_back(0, car, 0);
-        executePlan(*this, info, path[0].state, old.events, old.time);
-        for(auto &pos : path)pos.leafDist = 0;
 
-        ProgramState cur(info, path[0].state, {Event(infTime, e_end)}, 0);
+        best.clear();  startLeafDist = -optTileDist;
+        assert(!last);  last = make_shared<Position>(move(last), 0, car, 0);
+        executePlan(*this, info, last->state, old.events, old.time);
+
+        startLeafDist = 0;
+        ProgramState cur(info, last->state, {Event(infTime, e_end)}, 0);
         if(!cur.turnEnd)
         {
             cur.update(e_center);  executeProgram(info, cur, p_center);
@@ -1326,14 +1328,14 @@ struct Optimizer
             if(buf.empty())break;
             for(auto &track : buf)
             {
-                path.clear();  path.resize(track.tileDist);
-                path.emplace_back(track.time, track.state, track.events.size());
-                ProgramState cur(info, track.state, move(track.events), track.time);
-                ProgramType type = classifyState(track.state, cur, track.time);
+                last = track.last;
+                ProgramState cur(info, last->state, move(track.events), last->time);
+                ProgramType type = classifyState(last->state, cur, last->time);
                 ::executeProgram(*this, program[type], info,
-                    track.state, cur, track.time, track.time + programDuration[type]);
+                    last->state, cur, last->time, last->time + programDuration[type]);
             }
         }
+        last.reset();
     }
 
     void executeFallback(const model::Car &car, model::Move &move)
@@ -1377,9 +1379,9 @@ struct Optimizer
     {
         Plan *sel = nullptr;
         double score = -numeric_limits<double>::infinity();
-        for(auto &track : best)if(score < track.second.state.score)
+        for(auto &track : best)if(score < track.second.score)
         {
-            score = track.second.state.score;  sel = &track.second;
+            score = track.second.score;  sel = &track.second;
         }
         if(sel)
         {

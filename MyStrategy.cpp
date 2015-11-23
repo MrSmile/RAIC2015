@@ -198,7 +198,7 @@ constexpr double pickupScore = 5;
 constexpr double nitroCost = 50;
 constexpr double scoreBonus = 500;
 constexpr int repairPower = 4;
-constexpr double repairScore = 500;
+constexpr double damagePenalty = 100;
 constexpr double slickPenalty = 1000;
 
 constexpr int distPower = 4;
@@ -231,7 +231,8 @@ double frictMul, longFrict, crossFrict, rotFrictMul, angFrict, carRotFactor;
 double powerChange, invPowerChange, turnChange, invTurnChange;
 
 double bonusHalfSize;  RectInfo bonusInfo;
-double slickRadius;  int slidingTime;
+double slickRadius, slickRadius2;  int slidingTime;
+double washerRadius2, washerDamage;
 
 int globalTick = -1;
 
@@ -274,8 +275,11 @@ void initConsts(const model::Game &game, const model::World &world)
     bonusHalfSize = game.getBonusSize() / 2 - pickupDepth;
     bonusInfo.set(game.getBonusMass(), bonusHalfSize, bonusHalfSize);
 
-    slickRadius = game.getOilSlickRadius();
+    slickRadius = game.getOilSlickRadius() + pickupDepth;  slickRadius2 = sqr(slickRadius);
     slidingTime = game.getMaxOiledStateDurationTicks();
+
+    washerRadius2 = sqr(game.getWasherRadius());
+    washerDamage = game.getWasherDamage();
 }
 
 
@@ -306,10 +310,10 @@ struct Quad
         return Quad(pt, dir, hw, hh);
     }
 
-    bool checkPoint(const Vec2D &pt, double rad = 0) const
+    double pointDist2(const Vec2D &pt) const
     {
-        Vec2D dr = pt - pos;
-        return abs(dr * dir) < hw + rad && abs(dr % dir) < hh + rad;
+        Vec2D dr = pt - pos;  double dot = dr * dir, crs = dr % dir;
+        return Vec2D(dot - limit(dot, hw), crs - limit(crs, hh)).sqr();
     }
 
     void collideSide(double proj, double offs, double dot, double crs,
@@ -360,6 +364,16 @@ struct Slick
     }
 };
 
+struct Washer
+{
+    unsigned flag;  Vec2D pos, spd;
+
+    Washer(int index, const model::Projectile &proj) : flag(1 << (index & 31)),
+        pos(proj.getX(), proj.getY()), spd(proj.getSpeedX(), proj.getSpeedY())
+    {
+    }
+};
+
 struct TileMap
 {
     vector<bool> borders;
@@ -367,6 +381,7 @@ struct TileMap
     vector<vector<unsigned>> distMap;
     vector<vector<Bonus>> bonuses;
     vector<vector<Slick>> slicks;
+    vector<Washer> washers;
 
     void init(const model::World &world)
     {
@@ -432,7 +447,7 @@ struct TileMap
         slicks.resize(mapHeight * mapLine);
     }
 
-    void reset(const model::World &world)
+    void reset(const model::World &world, const model::Car &self)
     {
         for(auto &list : bonuses)list.clear();  int index = 0;
         double shift = (carRadius + bonusHalfSize) * invTileSize;
@@ -461,6 +476,11 @@ struct TileMap
             if(y >             0 && offs.y <     shift)slicks[k - mapLine].push_back(next);
             if(y < mapHeight - 1 && offs.y > 1 - shift)slicks[k + mapLine].push_back(next);
         }
+
+        washers.clear();
+        for(auto &proj : world.getProjectiles())
+            if(proj.getType() == model::WASHER && proj.getCarId() != self.getId())
+                washers.emplace_back(index++, proj);
     }
 
     static void pathfinderUpdate(vector<unsigned> &map, vector<int> &queue, int pos, unsigned dist)
@@ -608,7 +628,6 @@ struct TileMap
             norm.y = -norm.y;  pt.y = -pt.y;
         }
         pt += Vec2D(x, y) * tileSize;
-        if(!rect.checkPoint(pt, 1))cout << "NOT IN RECT!!!" << endl;
         return maxDepth;
     }
 };
@@ -635,7 +654,7 @@ struct CarState
 
     int waypoint;
     unsigned base, dist;
-    unsigned consumed;
+    unsigned hitFlags;
     double score;
 
     CarState() = default;
@@ -655,19 +674,19 @@ struct CarState
 
         Vec2D offs = pos * invTileSize;  int k = int(offs.y) * mapLine + int(offs.x);
         base = tileMap.waypointDistMap(waypoint = car.getNextWaypointIndex())[k];
-        dist = 0;  consumed = 0;  score = 0;
+        dist = 0;  hitFlags = 0;  score = 0;
     }
 
-    bool update(const CarInfo &info, int time, double power, double turn, double frict)
+    bool update(const CarInfo &info, int time, double power, double turn, double wfrict, double hfrict, double africt)
     {
         Vec2D accel = (signbit(power) ? info.carReverse : info.carAccel) * power * dir;
         double rot = carRotFactor * turn * (spd * dir), borderDist = maxDist;
         for(int i = 0; i < physIter; i++)
         {
             pos += spd * physDt;  spd += accel;  spd *= frictMul;
-            spd -= limit(spd * dir, frict) * dir + limit(spd % dir, crossFrict) * ~dir;
+            spd -= limit(spd * dir, wfrict) * dir + limit(spd % dir, hfrict) * ~dir;
             dir = sincos(angle += rot + angSpd * physDt);  angSpd *= rotFrictMul;
-            angSpd -= limit(angSpd, angFrict);
+            angSpd -= limit(angSpd, africt);
 
             Quad rect(pos, dir, carHalfWidth, carHalfHeight);  Vec2D norm, pt;
             double depth = tileMap.collideBorder(rect, norm, pt);
@@ -689,10 +708,10 @@ struct CarState
             }
 
             Vec2D offs = pos * invTileSize;  int k = int(offs.y) * mapLine + int(offs.x);
-            for(auto &bonus : tileMap.bonuses[k])if((consumed & bonus.flag) != bonus.flag)
+            for(const auto &bonus : tileMap.bonuses[k])if((hitFlags & bonus.flag) != bonus.flag)
             {
                 double depth = bonus.collide(rect, norm, pt);
-                if(depth < 0)continue;  consumed |= bonus.flag;
+                if(depth < 0)continue;  hitFlags |= bonus.flag;
 
                 Vec2D relSpd = spd + (rot * physIter + angSpd) * ~(pt - pos);
                 double normSpd = relSpd * norm;
@@ -706,24 +725,32 @@ struct CarState
 
                 switch(bonus.type)
                 {
-                case model::REPAIR_KIT:    score += repairScore * pow<repairPower>(1 - durability);  durability = 1;  break;
-                case model::AMMO_CRATE:    ammoCount++;   break;
+                case model::REPAIR_KIT:    durability = 1;  break;
+                case model::AMMO_CRATE:    ammoCount++;  break;
                 case model::NITRO_BOOST:   score += nitroCost;  nitroCount++;  break;
-                case model::OIL_CANISTER:  oilCount++;    break;
+                case model::OIL_CANISTER:  oilCount++;  break;
                 case model::PURE_SCORE:    score += scoreBonus;  break;
                 default:  break;
                 }
                 score += pickupScore;
             }
-            if(time >= slidingEnd)for(auto &slick : tileMap.slicks[k])
+
+            if(time >= slidingEnd)for(const auto &slick : tileMap.slicks[k])
             {
-                if(!rect.checkPoint(slick.pos, slickRadius))continue;
+                if(rect.pointDist2(slick.pos) > slickRadius2)continue;
                 slidingEnd = min(time + slidingTime, slick.endTime);
                 score -= slickPenalty;
             }
+
+            for(const auto &washer : tileMap.washers)if((hitFlags & washer.flag) != washer.flag)
+            {
+                if(rect.pointDist2(washer.pos + time * washer.spd) > washerRadius2)continue;
+                durability -= washerDamage;  if(durability < 0)return false;
+            }
         }
+        score -= damagePenalty * pow<repairPower>(1 - durability);
         score -= distPenalty * pow<distPower>(1 - max(0.0, borderDist) / maxDist);
-        score--;  return true;
+        return true;
     }
 
     bool activateNitro(int time)
@@ -737,20 +764,24 @@ struct CarState
     {
         if(time >= optLookahead)return false;
 
-        // TODO: broken & sliding
+        // TODO: broken
 
         power += limit(powerTarget - power, powerChange);
         turn += limit(turnTarget - turn, turnChange);
-        double curPower = power, frict = longFrict;
+        double curPower = power, wfrict = longFrict, hfrict = crossFrict, africt = angFrict;
         if(time < nitroEnd)
         {
             power = 1;  curPower = nitroPower;
         }
         if(brake)
         {
-            curPower = 0;  frict = crossFrict;
+            curPower = 0;  wfrict = crossFrict;
         }
-        if(!update(info, time, curPower, turn, frict))return false;
+        if(time < slidingEnd)
+        {
+            wfrict = hfrict = longFrict;  africt = angFrict / 5;
+        }
+        if(!update(info, time, curPower, turn, wfrict, hfrict, africt))return false;
         if(powerTarget < 1)score -= reversePenalty;
 
         Vec2D offs = pos * invTileSize;
@@ -1226,7 +1257,7 @@ struct Plan
     {
         last = pos;  time = pos->time;
         tileDist = pos->state.dist;  leafDist = pos->leafDist;
-        score = pos->state.score;
+        score = pos->state.score - time;
 
         events.clear();  events.reserve(pos->eventCount + 1);
         events.insert(events.begin(), base.begin(), base.begin() + pos->eventCount);
@@ -1417,7 +1448,7 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
             initConsts(game, world);  srand(game.getRandomSeed());
             tileMap.init(world);
         }
-        globalTick = world.getTick();  tileMap.reset(world);
+        globalTick = world.getTick();  tileMap.reset(world, self);
     }
 
     if(globalTick < game.getInitialFreezeDurationTicks())
@@ -1440,6 +1471,16 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
 
     move.setEnginePower(globalTick < 300 ? 1 : 0);
     move.setWheelTurn(globalTick >= 280 && globalTick < 300 ? 0.8827958 : 0);
+
+    if(globalTick < 190)
+    {
+        move.setSpillOil(true);  move.setEnginePower(-1);
+    }
+    else
+    {
+        move.setEnginePower(1);  move.setWheelTurn(0.2);
+        move.setBrake(globalTick > 300);
+    }
 
     static double baseAngSpd;
     static double predAngle, predAngSpd;
@@ -1473,14 +1514,16 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
     if(move.isBrake())power = 0;  unsigned consumed = 0;
 
     Vec2D dir = sincos(angle), accel = power * dir;
-    double frict = move.isBrake() ? crossFrict : longFrict;
+    double wfrict = self.getRemainingOiledTicks() || !move.isBrake() ? longFrict : crossFrict;
+    double hfrict = self.getRemainingOiledTicks() ? longFrict : crossFrict;
+    double africt = self.getRemainingOiledTicks() ? angFrict / 5 : angFrict;
     double rot = carRotFactor * turn * (spd * dir);
     for(int i = 0; i < physIter; i++)
     {
         pos += spd * physDt;  spd += accel;  spd *= frictMul;
-        spd -= limit(spd * dir, frict) * dir + limit(spd % dir, crossFrict) * ~dir;
+        spd -= limit(spd * dir, wfrict) * dir + limit(spd % dir, hfrict) * ~dir;
         dir = sincos(angle += rot + angSpd * physDt);  angSpd *= rotFrictMul;
-        angSpd -= limit(angSpd, angFrict);
+        angSpd -= limit(angSpd, africt);
 
         Quad rect(pos, dir, carHalfWidth, carHalfHeight);  Vec2D norm, pt;
         double depth = tileMap.collideBorder(rect, norm, pt);

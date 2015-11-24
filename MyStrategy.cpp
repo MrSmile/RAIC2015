@@ -195,10 +195,10 @@ constexpr double tileToggle = 0.49;
 constexpr double tileScore = 100000;
 
 constexpr double pickupScore = 5;
-constexpr double ammoCost = 50, nitroCost = 100, oilCost = 0, scoreBonus = 500;
+constexpr double ammoCost = 50, nitroCost = 50, oilCost = 0, scoreBonus = 500;
 constexpr int repairPower = 2, firePower = 2;
 constexpr double damagePenalty = 100, damageScore = 500;
-constexpr double slickPenalty = 1000;
+constexpr double slickPenalty = 300;
 
 constexpr int distPower = 4;
 constexpr double distPenalty = 100;

@@ -169,7 +169,7 @@ inline constexpr Vec2D conj(const Vec2D &v)
 }
 
 
-struct RectInfo
+struct BodyInfo
 {
     double invMass, invAngMass;
 
@@ -179,7 +179,7 @@ struct RectInfo
     }
 };
 
-struct CarInfo : public RectInfo
+struct CarInfo : public BodyInfo
 {
     double carAccel, carReverse;
 
@@ -206,7 +206,6 @@ constexpr double distPenalty = 100;
 constexpr double reversePenalty = 10;
 constexpr double maxBlowSpeed = 3;
 constexpr double pickupDepth = 5;
-constexpr double pickupSpeed = 0;
 
 constexpr double largeSpeed = 30;
 
@@ -218,7 +217,7 @@ constexpr int physIter = 1;
 constexpr double physDt = 1.0 / physIter;
 constexpr double carBounce = 1.25, carFrict = sqrt(0.125);
 constexpr double bonusBounce = 1.5, bonusFrict = sqrt(0.5);
-constexpr RectInfo borderInfo = {0, 0};
+constexpr BodyInfo borderInfo = {0, 0};
 
 double tileSize, invTileSize, tileMargin;
 int mapWidth, mapHeight, mapLine;
@@ -230,7 +229,7 @@ double carHalfWidth, carHalfHeight, carRadius;  CarInfo carInfo[2];
 double frictMul, longFrict, crossFrict, rotFrictMul, angFrict, carRotFactor;
 double powerChange, invPowerChange, turnChange, invTurnChange;
 
-double bonusHalfSize;  RectInfo bonusInfo;
+double bonusHalfSize;  BodyInfo bonusInfo;
 double slickRadius, slickRadius2;  int slidingTime;
 double washerRadius2, washerDamage;
 
@@ -238,7 +237,7 @@ int globalTick = -1;
 
 void CarInfo::set(double mass, double power, double rear)
 {
-    RectInfo::set(mass, carHalfWidth, carHalfHeight);
+    BodyInfo::set(mass, carHalfWidth, carHalfHeight);
     carAccel   = power * invMass * physDt;
     carReverse = rear  * invMass * physDt;
 }
@@ -267,7 +266,7 @@ void initConsts(const model::Game &game, const model::World &world)
     crossFrict = game.getCarCrosswiseMovementFrictionFactor() * physDt;
     rotFrictMul = pow(1 - game.getCarRotationAirFrictionFactor(), physDt);
     angFrict = game.getCarRotationFrictionFactor() * physDt;
-    carRotFactor = game.getCarAngularSpeedFactor() * physDt;
+    carRotFactor = game.getCarAngularSpeedFactor();
 
     powerChange = game.getCarEnginePowerChangePerTick();  invPowerChange = 1 / powerChange;
     turnChange = game.getCarWheelTurnChangePerTick();  invTurnChange = 1 / turnChange;
@@ -635,14 +634,6 @@ struct TileMap
 TileMap tileMap;
 
 
-void solveImpulse(const RectInfo &info, const Vec2D &pos, Vec2D &spd, double &angSpd,
-    const RectInfo &info1, const Vec2D &pos1, const Vec2D &norm, const Vec2D &pt, double coeff)
-{
-    double w = (pt - pos) % norm, w1 = (pt - pos1) % norm;
-    double invEffMass = info.invMass + info1.invMass + w * w * info.invAngMass + w1 * w1 * info1.invAngMass;
-    double impulse = coeff / invEffMass;  spd += impulse * info.invMass * norm;  angSpd += impulse * info.invAngMass * w;
-}
-
 struct CarState
 {
     Vec2D pos, spd, dir;
@@ -651,11 +642,6 @@ struct CarState
     int breakEnd, slidingEnd, nitroEnd;
     int nitroCount, ammoCount, oilCount;
     double durability, power, turn;
-
-    int waypoint;
-    unsigned base, dist;
-    unsigned hitFlags;
-    double score;
 
     CarState() = default;
 
@@ -671,103 +657,14 @@ struct CarState
         durability = car.getDurability();
         power = car.getEnginePower();
         turn = car.getWheelTurn();
-
-        Vec2D offs = pos * invTileSize;  int k = int(offs.y) * mapLine + int(offs.x);
-        base = tileMap.waypointDistMap(waypoint = car.getNextWaypointIndex())[k];
-        dist = 0;  hitFlags = 0;  score = 0;
     }
 
-    bool update(const CarInfo &info, int time, double power, double turn, double wfrict, double hfrict, double africt)
+    template<typename T, typename S> bool nextStep(S &state,
+        const CarInfo &info, int time, int powerTarget, int turnTarget, bool brake)
     {
-        Vec2D accel = (signbit(power) ? info.carReverse : info.carAccel) * power * dir;
-        double rot = carRotFactor * turn * (spd * dir), borderDist = maxDist;
-        for(int i = 0; i < physIter; i++)
-        {
-            pos += spd * physDt;  spd += accel;  spd *= frictMul;
-            spd -= limit(spd * dir, wfrict) * dir + limit(spd % dir, hfrict) * ~dir;
-            dir = sincos(angle += rot + angSpd * physDt);  angSpd *= rotFrictMul;
-            angSpd -= limit(angSpd, africt);
-
-            Quad rect(pos, dir, carHalfWidth, carHalfHeight);  Vec2D norm, pt;
-            double depth = tileMap.collideBorder(rect, norm, pt);
-            borderDist = min(borderDist, -depth);
-            if(depth > 0)
-            {
-                Vec2D relSpd = spd + (rot * physIter + angSpd) * ~(pt - pos);
-                double normSpd = relSpd * norm;
-                if(normSpd < 0)
-                {
-                    if(normSpd < -maxBlowSpeed)return false;
-                    double frictCoeff = carFrict * normSpd / sqrt(relSpd.sqr() + spdEps2);
-                    solveImpulse(info, pos, spd, angSpd, borderInfo, pt,  norm, pt, -carBounce * normSpd);
-                    solveImpulse(info, pos, spd, angSpd, borderInfo, pt, ~norm, pt, frictCoeff * (relSpd % norm));
-
-                    // TODO: reduce score
-                }
-                pos += depth * norm;
-            }
-
-            Vec2D offs = pos * invTileSize;  int k = int(offs.y) * mapLine + int(offs.x);
-            for(const auto &bonus : tileMap.bonuses[k])if((hitFlags & bonus.flag) != bonus.flag)
-            {
-                double depth = bonus.collide(rect, norm, pt);
-                if(depth < 0)continue;  hitFlags |= bonus.flag;
-
-                Vec2D relSpd = spd + (rot * physIter + angSpd) * ~(pt - pos);
-                double normSpd = relSpd * norm;
-                if(normSpd < 0)
-                {
-                    double frictCoeff = bonusFrict * normSpd / sqrt(relSpd.sqr() + spdEps2);
-                    solveImpulse(info, pos, spd, angSpd, bonusInfo, bonus.pos,  norm, pt, -bonusBounce * normSpd);
-                    solveImpulse(info, pos, spd, angSpd, bonusInfo, bonus.pos, ~norm, pt, frictCoeff * (relSpd % norm));
-                }
-                pos += 0.5 * depth * norm;  if(normSpd > -pickupSpeed)continue;
-
-                switch(bonus.type)
-                {
-                case model::REPAIR_KIT:    durability = 1;  break;
-                case model::AMMO_CRATE:    ammoCount++;  break;
-                case model::NITRO_BOOST:   score += nitroCost;  nitroCount++;  break;
-                case model::OIL_CANISTER:  oilCount++;  break;
-                case model::PURE_SCORE:    score += scoreBonus;  break;
-                default:  break;
-                }
-                score += pickupScore;
-            }
-
-            if(time >= slidingEnd)for(const auto &slick : tileMap.slicks[k])
-            {
-                if(rect.pointDist2(slick.pos) > slickRadius2)continue;
-                slidingEnd = min(time + slidingTime, slick.endTime);
-                score -= slickPenalty;
-            }
-
-            for(const auto &washer : tileMap.washers)if((hitFlags & washer.flag) != washer.flag)
-            {
-                if(rect.pointDist2(washer.pos + time * washer.spd) > washerRadius2)continue;
-                durability -= washerDamage;  if(durability < 0)return false;
-            }
-        }
-        score -= damagePenalty * pow<repairPower>(1 - durability);
-        score -= distPenalty * pow<distPower>(1 - max(0.0, borderDist) / maxDist);
-        return true;
-    }
-
-    bool activateNitro(int time)
-    {
-        if(!nitroCount || time < nitroEnd + nitroCooldown)return false;
-        power = 1;  nitroEnd = time + nitroDuration;  nitroCount--;
-        score -= nitroCost;  return true;
-    }
-
-    bool nextStep(const CarInfo &info, int time, int powerTarget, int turnTarget, bool brake)
-    {
-        if(time >= optLookahead)return false;
-
         // TODO: broken
 
-        power += limit(powerTarget - power, powerChange);
-        turn += limit(turnTarget - turn, turnChange);
+        power += limit(powerTarget - power, powerChange);  turn += limit(turnTarget - turn, turnChange);
         double curPower = power, wfrict = longFrict, hfrict = crossFrict, africt = angFrict;
         if(time < nitroEnd)
         {
@@ -781,20 +678,156 @@ struct CarState
         {
             wfrict = hfrict = longFrict;  africt = angFrict / 5;
         }
-        if(!update(info, time, curPower, turn, wfrict, hfrict, africt))return false;
+
+        Vec2D accel = (signbit(curPower) ? info.carReverse : info.carAccel) * curPower * dir;
+        double rot = carRotFactor * turn * (spd * dir);  angSpd += rot;
+        for(int i = 0; i < physIter; i++)
+        {
+            pos += spd * physDt;  spd += accel;  spd *= frictMul;
+            spd -= limit(spd * dir, wfrict) * dir + limit(spd % dir, hfrict) * ~dir;
+            dir = sincos(angle += angSpd * physDt);  angSpd -= rot;
+            angSpd *= rotFrictMul;  angSpd += rot - limit(angSpd, africt);
+
+            Quad car(pos, dir, carHalfWidth, carHalfHeight);
+            if(!static_cast<T *>(this)->collide(info, car, time, state))return false;
+        }
+        angSpd -= rot;  return true;
+    }
+
+    bool activateNitro(int time)
+    {
+        if(!nitroCount || time < nitroEnd + nitroCooldown)return false;
+        nitroEnd = time + nitroDuration;  nitroCount--;  return true;
+    }
+};
+
+void solveImpulse(const BodyInfo &info, const Vec2D &pos, Vec2D &spd, double &angSpd,
+    const BodyInfo &info1, const Vec2D &pos1, const Vec2D &norm, const Vec2D &pt, double coeff)
+{
+    double w = (pt - pos) % norm, w1 = (pt - pos1) % norm;
+    double invEffMass = info.invMass + info1.invMass + w * w * info.invAngMass + w1 * w1 * info1.invAngMass;
+    double impulse = coeff / invEffMass;  spd += impulse * info.invMass * norm;  angSpd += impulse * info.invAngMass * w;
+}
+
+double solveCollision(const BodyInfo &info, CarState &car,
+    const BodyInfo &info1, const Vec2D &pos1, const Vec2D &norm, const Vec2D &pt, double bounce, double frict)
+{
+    Vec2D relSpd = car.spd + ~(pt - car.pos) * car.angSpd;
+    double normSpd = relSpd * norm;
+    if(normSpd < 0)
+    {
+        frict *= normSpd / sqrt(relSpd.sqr() + spdEps2);
+        solveImpulse(info, car.pos, car.spd, car.angSpd, info1, pos1,  norm, pt, -bounce * normSpd);
+        solveImpulse(info, car.pos, car.spd, car.angSpd, info1, pos1, ~norm, pt, frict * (relSpd % norm));
+    }
+    return normSpd;
+}
+
+
+struct AllyState : public CarState
+{
+    int waypoint;
+    unsigned base, dist;
+    unsigned hitFlags;
+    double score;
+
+    AllyState() = default;
+
+    AllyState(const model::Car &car) : CarState(car), dist(0), hitFlags(0), score(0)
+    {
+        Vec2D offs = pos * invTileSize;  int k = int(offs.y) * mapLine + int(offs.x);
+        base = tileMap.waypointDistMap(waypoint = car.getNextWaypointIndex())[k];
+    }
+
+    struct StepState
+    {
+        double borderDist;
+        Vec2D offs;
+        int cell;
+
+        StepState() : borderDist(maxDist)
+        {
+        }
+
+        void calcCell(const Vec2D &pos)
+        {
+            offs = pos * invTileSize;  int x = int(offs.x), y = int(offs.y);
+            cell = y * mapLine + x;  offs -= Vec2D(x + 0.5, y + 0.5);
+        }
+    };
+
+    bool collide(const CarInfo &info, Quad &car, int time, StepState &state)
+    {
+        Vec2D norm, pt;
+        double depth = tileMap.collideBorder(car, norm, pt);
+        state.borderDist = min(state.borderDist, -depth);
+        if(depth > 0)
+        {
+            if(solveCollision(info, *this, borderInfo, pt,
+                norm, pt, carBounce, carFrict) < -maxBlowSpeed)return false;
+            pos += depth * norm;
+        }
+
+        state.calcCell(pos);
+        for(const auto &bonus : tileMap.bonuses[state.cell])if((hitFlags & bonus.flag) != bonus.flag)
+        {
+            double depth = bonus.collide(car, norm, pt);  if(depth < 0)continue;
+            solveCollision(info, *this, bonusInfo, bonus.pos, norm, pt, bonusBounce, bonusFrict);
+            pos += 0.5 * depth * norm;  hitFlags |= bonus.flag;
+
+            switch(bonus.type)
+            {
+            case model::REPAIR_KIT:    durability = 1;  break;
+            case model::AMMO_CRATE:    ammoCount++;  break;
+            case model::NITRO_BOOST:   score += nitroCost;  nitroCount++;  break;
+            case model::OIL_CANISTER:  oilCount++;  break;
+            case model::PURE_SCORE:    score += scoreBonus;  break;
+            default:  break;
+            }
+            score += pickupScore;
+        }
+
+        if(time >= slidingEnd)for(const auto &slick : tileMap.slicks[state.cell])
+        {
+            if(car.pointDist2(slick.pos) > slickRadius2)continue;
+            slidingEnd = min(time + slidingTime, slick.endTime);
+            score -= slickPenalty;
+        }
+
+        for(const auto &washer : tileMap.washers)if((hitFlags & washer.flag) != washer.flag)
+        {
+            if(car.pointDist2(washer.pos + time * washer.spd) > washerRadius2)continue;
+            durability -= washerDamage;  if(durability < 0)return false;
+        }
+
+        return true;
+    }
+
+    bool activateNitro(int time)
+    {
+        if(!CarState::activateNitro(time))return false;
+        score -= nitroCost;  return true;
+    }
+
+    bool nextStep(const CarInfo &info, int time, int powerTarget, int turnTarget, bool brake)
+    {
+        if(time >= optLookahead)return false;
+
+        StepState state;
+        if(!CarState::nextStep<AllyState>(state, info, time, powerTarget, turnTarget, brake))return false;
+        score -= distPenalty * pow<distPower>(1 - max(0.0, state.borderDist) / maxDist);
+        score -= damagePenalty * pow<repairPower>(1 - durability);
         if(powerTarget < 1)score -= reversePenalty;
 
-        Vec2D offs = pos * invTileSize;
-        int x = int(offs.x), y = int(offs.y), k = y * mapLine + x;
-        if(abs(offs.x - x - 0.5) > tileToggle || abs(offs.y - y - 0.5) > tileToggle)return true;
-        unsigned cur = tileMap.distMap[waypoint][k];  if(cur + dist >= base)return true;
+        if(abs(state.offs.x) > tileToggle || abs(state.offs.y) > tileToggle)return true;
+        unsigned cur = tileMap.distMap[waypoint][state.cell];  if(cur + dist >= base)return true;
         dist = base - cur;  score += tileScore;  if(cur)return true;
 
         if(size_t(++waypoint) >= tileMap.waypoints.size())  // TODO: detect finish
         {
             nitroCount++;  ammoCount++;  oilCount++;  waypoint = 0;
         }
-        base += tileMap.waypointDistMap(waypoint)[k];  return true;
+        base += tileMap.waypointDistMap(waypoint)[state.cell];  return true;
     }
 
     static int classify(Vec2D vec)
@@ -880,14 +913,14 @@ struct Move
         }
     }
 
-    bool nextStep(const CarInfo &info, CarState &state, int time)
+    bool nextStep(const CarInfo &info, AllyState &state, int time)
     {
         if((flags & f_nitro) && !state.activateNitro(time))return false;
         flags = 0;  return state.nextStep(info, time, power, turn, brake);
     }
 
     template<typename T> bool nextStep(T &handler,
-        const CarInfo &info, CarState &state, const vector<Event> &events, int time)
+        const CarInfo &info, AllyState &state, const vector<Event> &events, int time)
     {
         unsigned old = state.dist;  if(!nextStep(info, state, time))return false;
         return old == state.dist || handler.evaluate(info, state, events, time + 1);
@@ -918,7 +951,7 @@ struct ProgramState : public Move
     int prevPower, prevTurn, turnEvent, turnEnd;
     bool prevBrake;
 
-    ProgramState(const CarInfo &info, const CarState &state, vector<Event> &&base, int time) : events(base), turnEvent(-1)
+    ProgramState(const CarInfo &info, const AllyState &state, vector<Event> &&base, int time) : events(base), turnEvent(-1)
     {
         int pos = 0;
         for(; events[pos].time < time; pos++)
@@ -945,7 +978,7 @@ struct ProgramState : public Move
         }
     }
 
-    void dumpEvents(CarState &state, int time)
+    void dumpEvents(AllyState &state, int time)
     {
         if(prevPower != power)
         {
@@ -978,7 +1011,7 @@ struct ProgramState : public Move
         if(flags & f_nitro)events.emplace_back(time, e_nitro);
     }
 
-    template<typename T> bool process(T &handler, const CarInfo &info, CarState &state, int &time, int endTime)
+    template<typename T> bool process(T &handler, const CarInfo &info, AllyState &state, int &time, int endTime)
     {
         if(time >= endTime)return true;  dumpEvents(state, time);
         while(time < endTime)if(!nextStep(handler, info, state, events, time++))return false;
@@ -987,7 +1020,7 @@ struct ProgramState : public Move
 };
 
 template<typename T> void executePlan(T &handler,
-    const CarInfo &info, CarState state, const vector<Event> &events, int endTime)
+    const CarInfo &info, AllyState state, const vector<Event> &events, int endTime)
 {
     Move cur;  int time = 0, pos = 0;
     while(time < endTime)
@@ -1000,7 +1033,7 @@ template<typename T> void executePlan(T &handler,
 }
 
 template<typename T> void executeProgram(T &handler, const Command *program,
-    const CarInfo &info, CarState state, ProgramState cur, int startTime, int endTime)
+    const CarInfo &info, AllyState state, ProgramState cur, int startTime, int endTime)
 {
     int time = startTime;  bool completed = false;
     for(;;)
@@ -1051,7 +1084,7 @@ template<typename T> void executeProgram(T &handler, const Command *program,
 }
 
 template<typename T> void executeProgram(T &handler, const Command *program, int duration,
-    const CarInfo &info, const CarState &state, vector<Event> &&events, int start)
+    const CarInfo &info, const AllyState &state, vector<Event> &&events, int start)
 {
     ProgramState cur(info, state, move(events), start);
     executeProgram(handler, program, info, state, cur, start, start + duration);
@@ -1218,7 +1251,7 @@ const Command *const program[] =
 
 const int programDuration[] = {100, 100, 100, 100, 100, 300};
 
-ProgramType classifyState(const CarState &state, const ProgramState &cur, int time)
+ProgramType classifyState(const AllyState &state, const ProgramState &cur, int time)
 {
     if(cur.power < 1)return p_back;
     if(cur.turn)return cur.turn < 0 ? p_left : p_right;
@@ -1231,10 +1264,10 @@ struct Position
 {
     int time, leafDist;
     shared_ptr<Position> prev;
-    CarState state;
+    AllyState state;
     int eventCount;
 
-    Position(shared_ptr<Position> &&prev_, int time_, const CarState &state_, int eventCount_) :
+    Position(shared_ptr<Position> &&prev_, int time_, const AllyState &state_, int eventCount_) :
         time(time_), leafDist(0), prev(prev_), state(state_), eventCount(eventCount_)
     {
     }
@@ -1292,7 +1325,7 @@ struct Optimizer
     {
     }
 
-    bool evaluate(const CarInfo &info, const CarState &state, const vector<Event> &events, int time)
+    bool evaluate(const CarInfo &info, const AllyState &state, const vector<Event> &events, int time)
     {
         assert(state.dist <= optTileDist);
         last = make_shared<Position>(move(last), time, state, events.size());
@@ -1517,7 +1550,7 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
     double wfrict = self.getRemainingOiledTicks() || !move.isBrake() ? longFrict : crossFrict;
     double hfrict = self.getRemainingOiledTicks() ? longFrict : crossFrict;
     double africt = self.getRemainingOiledTicks() ? angFrict / 5 : angFrict;
-    double rot = carRotFactor * turn * (spd * dir);
+    double rot = carRotFactor * turn * (spd * dir) * physDt;
     for(int i = 0; i < physIter; i++)
     {
         pos += spd * physDt;  spd += accel;  spd *= frictMul;

@@ -195,10 +195,10 @@ constexpr double tileToggle = 0.49;
 constexpr double tileScore = 100000;
 
 constexpr double pickupScore = 5;
-constexpr double ammoCost = 50, nitroCost = 50, oilCost = 0, scoreBonus = 500;
+constexpr double ammoCost = 50, nitroCost = 50, oilCost = 50, scoreBonus = 500;
 constexpr int repairPower = 2, firePower = 2;
 constexpr double damagePenalty = 100, damageScore = 500;
-constexpr double slickPenalty = 300;
+constexpr double slickPenalty = 300, slickScore = 2;
 
 constexpr int distPower = 4;
 constexpr double distPenalty = 100;
@@ -230,11 +230,11 @@ double frictMul, longFrict, crossFrict, rotFrictMul, angFrict, carRotFactor;
 double powerChange, invPowerChange, turnChange, invTurnChange;
 
 double bonusHalfSize;  BodyInfo bonusInfo;
-double slickRadius, slickRadius2;  int slidingTime;
+double slickRadius, slickRadius2, slickOffset;
+int slidingTime;
 
-double washerDamage, washerSpeed;
-double washerRadius, washerRadius2;
-Vec2D washerSideRot;
+double washerRadius, washerRadius2;  Vec2D washerSideRot;
+double washerSpeed, washerDamage;
 
 int globalTick = -1;
 
@@ -277,14 +277,16 @@ void initConsts(const model::Game &game, const model::World &world)
     bonusHalfSize = game.getBonusSize() / 2 - pickupDepth;
     bonusInfo.set(game.getBonusMass(), bonusHalfSize, bonusHalfSize);
 
-    slickRadius = game.getOilSlickRadius() + pickupDepth;  slickRadius2 = sqr(slickRadius);
+    slickRadius = game.getOilSlickRadius();
+    slickRadius2 = sqr(slickRadius + pickupDepth);
+    slickOffset = game.getOilSlickInitialRange() + carHalfWidth + slickRadius;
     slidingTime = game.getMaxOiledStateDurationTicks();
 
-    washerDamage = game.getWasherDamage();
-    washerSpeed = game.getWasherInitialSpeed();
     washerRadius = game.getWasherRadius();
     washerRadius2 = sqr(washerRadius + pickupDepth);
     washerSideRot = sincos(game.getSideWasherAngle());
+    washerSpeed = game.getWasherInitialSpeed();
+    washerDamage = game.getWasherDamage();
 }
 
 
@@ -469,7 +471,7 @@ struct TileMap
         }
 
         for(auto &list : slicks)list.clear();
-        shift = (carRadius + slickRadius) * invTileSize;
+        shift = (carRadius + slickRadius + pickupDepth) * invTileSize;
         for(auto &slick : world.getOilSlicks())
         {
             Slick next(slick);  Vec2D offs = next.pos * invTileSize;
@@ -645,7 +647,7 @@ struct CarState
     Vec2D pos, spd, dir;
     double angle, angSpd;
 
-    int breakEnd, slidingEnd, nitroEnd, fireReady;
+    int breakEnd, slidingEnd, nitroEnd, fireReady, oilReady;
     int ammoCount, nitroCount, oilCount;
     double durability, power, turn;
 
@@ -658,6 +660,7 @@ struct CarState
         slidingEnd = car.getRemainingOiledTicks();
         nitroEnd = car.getRemainingNitroCooldownTicks() - nitroCooldown;
         fireReady = car.getRemainingProjectileCooldownTicks();
+        oilReady = car.getRemainingOilCooldownTicks();
         ammoCount = car.getProjectileCount();
         nitroCount = car.getNitroChargeCount();
         oilCount = car.getOilCanisterCount();
@@ -771,10 +774,10 @@ struct EnemyPosition
         pos = state.pos;  dir = state.dir;  return *this;
     }
 
-    bool checkWasher(const Vec2D &washer) const
+    bool checkCircle(const Vec2D &pt, double rad) const
     {
         Quad car(pos, dir, carHalfWidth, carHalfHeight);
-        return car.pointDist2(washer) < sqr(washerRadius - pickupDepth);
+        return car.pointDist2(pt) < sqr(rad - pickupDepth);
     }
 };
 
@@ -789,16 +792,20 @@ struct Box
     {
     }
 
+    Box(double xMin_, double xMax_, double yMin_, double yMax_) :
+        xMin(xMin_), xMax(xMax_), yMin(yMin_), yMax(yMax_)
+    {
+    }
+
     void add(const Vec2D &pt)
     {
         xMin = min(xMin, pt.x);  xMax = max(xMax, pt.x);
         yMin = min(yMin, pt.y);  yMax = max(yMax, pt.y);
     }
 
-    void offset(double border)
+    Box offset(double border) const
     {
-        xMin -= border;  xMax += border;
-        yMin -= border;  yMax += border;
+        return Box(xMin - border, xMax + border, yMin - border, yMax + border);
     }
 
     bool cross(const Box &box) const
@@ -814,20 +821,20 @@ struct Box
 
 struct EnemyTrack
 {
-    Box bound;
     EnemyPosition pos[enemyLookahead + 1][enemyTrackCount];
-    double durability;
+    Box bound;  double durability, speed;
 
     void calc(const model::Car &car)
     {
         const CarInfo &info = carInfo[car.getType()];
-        EnemyState state[enemyTrackCount] = {car, car, car};  bound = Box(state[0].pos);
+        EnemyState state[enemyTrackCount] = {car, car, car};
+        bound = Box(state[0].pos);  speed = state[0].spd.len();
         for(int time = 0; time < enemyLookahead; time++)for(int i = 0; i < enemyTrackCount; i++)
         {
             pos[time][i] = state[i];  state[i].nextStep(info, time, 1, i - 1, false);  bound.add(state[i].pos);
         }
         for(int i = 0; i < enemyTrackCount; i++)pos[enemyLookahead][i] = state[i];
-        bound.offset(carRadius);  durability = car.getDurability();
+        bound = bound.offset(carRadius);  durability = car.getDurability();
     }
 };
 
@@ -847,8 +854,8 @@ void calcEnemyTracks(const std::vector<model::Car> &cars)
 
 struct AllyState : public CarState
 {
-    int fireTime;
-    double fireScore;
+    int fireTime, oilTime;
+    double fireScore, oilScore;
 
     int waypoint;
     unsigned base, dist;
@@ -859,7 +866,7 @@ struct AllyState : public CarState
 
     AllyState(const model::Car &car) : CarState(car), dist(0), hitFlags(0), score(0)
     {
-        fireTime = infTime;  fireScore = 0;
+        fireTime = oilTime = infTime;  fireScore = oilScore = 0;
 
         Vec2D offs = pos * invTileSize;  int k = int(offs.y) * mapLine + int(offs.x);
         base = tileMap.waypointDistMap(waypoint = car.getNextWaypointIndex())[k];
@@ -931,39 +938,56 @@ struct AllyState : public CarState
 
     void tryFire(int time)
     {
-        Vec2D wspd[3];
-        wspd[0] = washerSpeed * dir;
-        wspd[1] = rotate(wspd[0], washerSideRot);
-        wspd[2] = rotate(wspd[0], conj(washerSideRot));
+        Vec2D speed[3];
+        speed[0] = washerSpeed * dir;
+        speed[1] = rotate(speed[0], washerSideRot);
+        speed[2] = rotate(speed[0], conj(washerSideRot));
 
-        Vec2D wpos[3] = {pos, pos, pos};  double score = 0;
+        Vec2D washer[3] = {pos, pos, pos};  double best = 0;
         double hw = washerSpeed * (enemyLookahead - time) / 2;
         Quad bound(pos + hw * dir, dir, hw, 2 * hw * washerSideRot.y);
-        for(const auto &track : enemyTracks)
+        for(const auto &track : enemyTracks)if(track.durability > 0)
         {
-            Box box = track.bound;  box.offset(washerRadius);  Vec2D norm, pt;
-            if(bound.collide(box, norm, pt) < 0)continue;
+            Vec2D norm, pt;
+            if(bound.collide(track.bound.offset(washerRadius), norm, pt) < 0)continue;
 
             int hit = 0;
             for(int flyTime = time + 1; flyTime <= enemyLookahead; flyTime++)
             {
-                for(int j = 0; j < 3; j++)wpos[j] += wspd[j];
-
-                int flag = 1;
-                for(int i = 0; i < enemyTrackCount; i++)
-                    for(int j = 0; j < 3; j++, flag <<= 1)
-                        if(track.pos[flyTime][i].checkWasher(wpos[j]))hit |= flag;
+                for(int j = 0; j < 3; j++)washer[j] += speed[j];
+                for(int i = 0, flag = 1; i < enemyTrackCount; i++)for(int j = 0; j < 3; j++, flag <<= 1)
+                    if(track.pos[flyTime][i].checkCircle(washer[j], washerRadius))hit |= flag;
             }
 
             constexpr int bitsum[] = {0, 1, 1, 2, 1, 2, 2, 3};
             int hitCount = min(min(bitsum[hit & 7], bitsum[(hit >> 3) & 7]), bitsum[(hit >> 6) & 7]);
             double durability = track.durability - hitCount * washerDamage;
             double delta = pow<firePower>(1 - max(0.0, durability)) - pow<firePower>(1 - track.durability);
-            if(durability < 0)delta += 1;  score = max(score, damageScore * delta);
+            if(durability < 0)delta += 1;  best = max(best, damageScore * delta);
         }
-        if(fireScore < (score -= ammoCost))
+        if(fireScore < (best -= ammoCost))
         {
-            fireTime = time;  fireScore = score;
+            fireTime = time;  fireScore = best;
+        }
+    }
+
+    void tryOil(int time)
+    {
+        Vec2D slick = pos - slickOffset * dir;  double best = -oilCost;
+        for(const auto &track : enemyTracks)
+        {
+            if(!track.bound.offset(slickRadius).cross(slick))continue;
+
+            int hit = 0;
+            for(int flyTime = time + 1; flyTime <= enemyLookahead; flyTime++)
+                for(int i = 0, flag = 1; i < enemyTrackCount; i++, flag <<= 1)
+                    if(track.pos[flyTime][i].checkCircle(slick, slickRadius))hit |= flag;
+
+            if(hit == 7)best += slickScore * track.speed;
+        }
+        if(oilScore < best)
+        {
+            oilTime = time;  oilScore = best;
         }
     }
 
@@ -977,6 +1001,7 @@ struct AllyState : public CarState
     {
         if(time >= allyLookahead)return false;
         if(ammoCount && time >= fireReady)tryFire(time);
+        if(oilCount && time >= oilReady)tryOil(time);
 
         StepState state;
         if(!CarState::nextStep<AllyState>(state, info, time, powerTarget, turnTarget, brake))return false;
@@ -1011,6 +1036,11 @@ struct AllyState : public CarState
         Vec2D offs = pos * invTileSize;  int x = int(offs.x), y = int(offs.y);
         return (y * mapLine + x) << 9 | (spd.sqr() > sqr(largeSpeed) ? 1 << 8 : 0) |
             classify(offs - Vec2D(x + 0.5, y + 0.5)) << 4 | classify(dir);
+    }
+
+    double calcScore(int time) const
+    {
+        return score + fireScore + oilScore - time;
     }
 };
 
@@ -1440,7 +1470,7 @@ struct Position
 
 struct Plan
 {
-    int time, fireTime, tileDist, leafDist;
+    int time, fireTime, oilTime, tileDist, leafDist;
     shared_ptr<Position> last;
     vector<Event> events;
     double score;
@@ -1453,9 +1483,10 @@ struct Plan
 
     void set(const vector<Event> &base, const shared_ptr<Position> &pos)
     {
-        last = pos;  time = pos->time;  fireTime = pos->state.fireTime;
+        last = pos;
+        fireTime = pos->state.fireTime;  oilTime = pos->state.oilTime;
         tileDist = pos->state.dist;  leafDist = pos->leafDist;
-        score = pos->state.score + pos->state.fireScore - time;
+        score = pos->state.calcScore(time = pos->time);
 
         events.clear();  events.reserve(pos->eventCount + 1);
         events.insert(events.begin(), base.begin(), base.begin() + pos->eventCount);
@@ -1464,8 +1495,11 @@ struct Plan
 
     void print() const
     {
-        if(fireTime < infTime)cout << "Path " << fireTime << ": ";
-        else cout << "Path: ";
+        cout << "Path ";
+        if(fireTime < infTime)cout << fireTime;
+        else cout << '-';  cout << ' ';
+        if(oilTime < infTime)cout << oilTime;
+        else cout << '-';  cout << ": ";
 
         constexpr char flags[] = "adbulcrn";
         for(const auto &evt : events)
@@ -1476,7 +1510,10 @@ struct Plan
 
     void execute(model::Move &move)
     {
-        Move::execute(events, move);  move.setThrowProjectile(!fireTime);  last.reset();
+        Move::execute(events, move);
+        move.setThrowProjectile(!fireTime);
+        move.setSpillOil(!oilTime);
+        last.reset();
     }
 };
 

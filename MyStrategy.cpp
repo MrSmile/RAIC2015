@@ -182,8 +182,9 @@ struct BodyInfo
 struct CarInfo : public BodyInfo
 {
     double carAccel, carReverse;
+    bool jeep;
 
-    void set(double mass, double power, double rear);
+    void set(model::CarType type, double mass, double power, double rear);
 };
 
 
@@ -198,7 +199,7 @@ constexpr double pickupScore = 5;
 constexpr double ammoCost = 50, nitroCost = 50, oilCost = 50, scoreBonus = 500;
 constexpr int repairPower = 2, firePower = 2;
 constexpr double damagePenalty = 100, damageScore = 500;
-constexpr double slickPenalty = 300, slickScore = 2;
+constexpr double slickPenalty = 50, slickScore = 2;
 constexpr double enemyPenalty = 1, enemySlickPenalty = 1;
 constexpr int impactLookahead = 20;
 
@@ -240,11 +241,12 @@ double washerSpeed, washerDamage;
 
 int globalTick = -1;
 
-void CarInfo::set(double mass, double power, double rear)
+void CarInfo::set(model::CarType type, double mass, double power, double rear)
 {
     BodyInfo::set(mass, carHalfWidth, carHalfHeight);
     carAccel   = power * invMass * physDt;
     carReverse = rear  * invMass * physDt;
+    jeep = (type == model::JEEP);
 }
 
 void initConsts(const model::Game &game, const model::World &world)
@@ -262,9 +264,9 @@ void initConsts(const model::Game &game, const model::World &world)
     carHalfWidth = game.getCarWidth() / 2;
     carHalfHeight = game.getCarHeight() / 2;
     carRadius = Vec2D(carHalfWidth, carHalfHeight).len();
-    carInfo[model::BUGGY].set(game.getBuggyMass(),
+    carInfo[model::BUGGY].set(model::BUGGY, game.getBuggyMass(),
         game.getBuggyEngineForwardPower(), game.getBuggyEngineRearPower());
-    carInfo[model::JEEP].set(game.getJeepMass(),
+    carInfo[model::JEEP].set(model::JEEP, game.getJeepMass(),
         game.getJeepEngineForwardPower(), game.getJeepEngineRearPower());
 
     frictMul = pow(1 - game.getCarMovementAirFrictionFactor(), physDt);
@@ -888,7 +890,7 @@ struct AllyState : public CarState
 
     AllyState() = default;
 
-    void tryFire(int time)
+    void tryFireWasher(int time)
     {
         Vec2D speed[3];
         speed[0] = washerSpeed * dir;
@@ -922,6 +924,11 @@ struct AllyState : public CarState
         }
     }
 
+    void tryFireTire(int time)
+    {
+        // TODO
+    }
+
     void tryOil(int time)
     {
         Vec2D slick = pos - slickOffset * dir;  double best = -oilCost;
@@ -942,10 +949,10 @@ struct AllyState : public CarState
         }
     }
 
-    void useBonuses(int time)
+    void useBonuses(bool jeep, int time)
     {
         if(time >= enemyLookahead)return;
-        if(ammoCount && time >= fireReady)tryFire(time);
+        if(ammoCount && time >= fireReady)jeep ? tryFireTire(time) : tryFireWasher(time);
         if(oilCount && time >= oilReady)tryOil(time);
     }
 
@@ -955,7 +962,8 @@ struct AllyState : public CarState
         Vec2D offs = pos * invTileSize;  int k = int(offs.y) * mapLine + int(offs.x);
         base = tileMap.waypointDistMap(waypoint = car.getNextWaypointIndex())[k];
 
-        fireTime = oilTime = infTime;  fireScore = oilScore = 0;  useBonuses(0);
+        fireTime = oilTime = infTime;  fireScore = oilScore = 0;
+        useBonuses(car.getType() == model::JEEP, 0);
     }
 
     struct StepState
@@ -1058,7 +1066,7 @@ struct AllyState : public CarState
         score -= distPenalty * pow<distPower>(1 - max(0.0, state.borderDist) / maxDist);
         score -= damagePenalty * pow<repairPower>(1 - durability);
         if(powerTarget < 1)score -= reversePenalty;
-        useBonuses(time + 1);
+        useBonuses(info.jeep, time + 1);
 
         if(abs(state.offs.x) > tileToggle || abs(state.offs.y) > tileToggle)return true;
         unsigned cur = tileMap.distMap[waypoint][state.cell];  if(cur + dist >= base)return true;
@@ -1752,6 +1760,27 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
 
     optimizer.process(self);
     optimizer.execute(self, move);
+
+    /*
+    move.setEnginePower(1);  move.setWheelTurn(-1);
+    move.setThrowProjectile(globalTick == 200);
+    for(auto &tire : world.getProjectiles())
+    {
+        static Vec2D predPos, predSpd;
+        static double predAngle, predAngSpd;
+        Vec2D pos(tire.getX(), tire.getY());
+        Vec2D spd(tire.getSpeedX(), tire.getSpeedY());
+        double angle = tire.getAngle(), angSpd = tire.getAngularSpeed();
+
+        Vec2D errPos = pos - predPos, errSpd = spd - predSpd;
+        cout << errPos.x << ' ' << errPos.y << ' ';
+        cout << errSpd.x << ' ' << errSpd.y << ' ';
+        cout << (angle - predAngle) << ' ' << (angSpd - predAngSpd) << endl;
+
+        predPos = pos + spd;  predSpd = spd;
+        predAngle = angle + angSpd;  predAngSpd = angSpd;
+    }
+    */
 
     /*
     move.setEnginePower(1);

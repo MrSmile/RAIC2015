@@ -177,12 +177,17 @@ struct BodyInfo
     {
         invMass = 1 / mass;  invAngMass = 3 * invMass / (hw * hw + hh * hh);
     }
+
+    void set(double mass, double rad)
+    {
+        invMass = 1 / mass;  invAngMass = 2 * invMass / (rad * rad);
+    }
 };
 
 struct CarInfo : public BodyInfo
 {
     double carAccel, carReverse;
-    bool jeep;
+    long long carId;  bool jeep;
 
     void set(model::CarType type, double mass, double power, double rear);
 };
@@ -239,6 +244,9 @@ int slickDuration, slidingTime;
 double washerRadius, washerRadius2;  Vec2D washerSideRot;
 double washerSpeed, washerDamage;
 
+double tireRadius, tireRadius2;  BodyInfo tireInfo;
+double tireSpeed, tireEndSpeed2, tireDamage;
+
 int globalTick = -1;
 
 void CarInfo::set(model::CarType type, double mass, double power, double rear)
@@ -268,6 +276,8 @@ void initConsts(const model::Game &game, const model::World &world)
         game.getBuggyEngineForwardPower(), game.getBuggyEngineRearPower());
     carInfo[model::JEEP].set(model::JEEP, game.getJeepMass(),
         game.getJeepEngineForwardPower(), game.getJeepEngineRearPower());
+    for(auto &car : world.getCars())if(car.isTeammate())
+        carInfo[car.getType()].carId = car.getId();
 
     frictMul = pow(1 - game.getCarMovementAirFrictionFactor(), physDt);
     longFrict = game.getCarLengthwiseMovementFrictionFactor() * physDt;
@@ -293,6 +303,13 @@ void initConsts(const model::Game &game, const model::World &world)
     washerSideRot = sincos(game.getSideWasherAngle());
     washerSpeed = game.getWasherInitialSpeed();
     washerDamage = game.getWasherDamage();
+
+    tireRadius = game.getTireRadius();
+    tireRadius2 = sqr(tireRadius + pickupDepth);
+    tireInfo.set(game.getTireMass(), tireRadius);
+    tireSpeed = game.getTireInitialSpeed();
+    tireEndSpeed2 = sqr(tireSpeed * game.getTireDisappearSpeedFactor());
+    tireDamage = game.getTireDamageFactor() / tireSpeed;
 }
 
 
@@ -327,6 +344,12 @@ struct Quad
     {
         Vec2D dr = pt - pos;  double dot = dr * dir, crs = dr % dir;
         return Vec2D(dot - limit(dot, hw), crs - limit(crs, hh)).sqr();
+    }
+
+    Vec2D collide(const Vec2D &pt) const
+    {
+        Vec2D dr = pt - pos;
+        return dr - limit(dr * dir, hw) * dir - limit(dr % dir, hh) * ~dir;
     }
 
     void collideSide(double proj, double offs, double dot, double crs,
@@ -516,6 +539,63 @@ struct TileMap
         return map;
     }
 
+    enum SymmetryFlags
+    {
+        flip_x = 1, flip_y = 2, swap_xy = 4
+    };
+
+    double collideBorder(const Vec2D &center, double rad, Vec2D &norm) const
+    {
+        Vec2D offs = center * invTileSize + Vec2D(0.5, 0.5);
+        int x = int(offs.x), y = int(offs.y);
+
+        int dx = 2, dy = 2 * mapLine;
+        int px = x * dx + y * dy, py = px + 1;
+
+        int flags = 0;
+        Vec2D pos = center - Vec2D(x, y) * tileSize;
+        if(signbit(pos.x))
+        {
+            flags |= flip_x;  px += dx;  dx = -dx;  pos.x = -pos.x;
+        }
+        if(signbit(pos.y))
+        {
+            flags |= flip_y;  py += dy;  dy = -dy;  pos.y = -pos.y;
+        }
+
+        double depth;
+        switch((borders[px + dx] ? 1 : 0) | (borders[py + dy] ? 2 : 0))
+        {
+        case 0:
+            {
+                double len = pos.len();  norm = pos / len;
+                depth = tileMargin + rad - len;  break;
+            }
+        case 1:
+            {
+                norm = {0, 1};  depth = tileMargin + rad - pos.y;  break;
+            }
+        case 2:
+            {
+                norm = {1, 0};  depth = tileMargin + rad - pos.x;  break;
+            }
+        default:
+            {
+                Vec2D d = Vec2D(2 * tileMargin, 2 * tileMargin) - pos;
+                if(d.x <= 0 || d.y <= 0)
+                {
+                    norm = d.x < d.y ? Vec2D(0, 1) : Vec2D(1, 0);
+                    depth = max(d.x, d.y) - tileMargin + rad;  break;
+                }
+                double len = d.len();  norm = d / len;
+                depth = len - tileMargin + rad;
+            }
+        }
+        if(flags & flip_x)norm.x = -norm.x;
+        if(flags & flip_y)norm.y = -norm.y;
+        return depth;
+    }
+
     double collideBorder(const Quad &rect, Vec2D &norm, Vec2D &pt) const
     {
         Vec2D pos = rect.pos, dir = rect.dir;
@@ -526,11 +606,6 @@ struct TileMap
 
         int dx = 2, dy = 2 * mapLine;
         int px = x * dx + y * dy, py = px + 1;
-
-        enum SymmetryFlags
-        {
-            flip_x = 1, flip_y = 2, swap_xy = 4
-        };
 
         int flags = 0;
         pos -= Vec2D(x, y) * tileSize;
@@ -641,6 +716,94 @@ struct TileMap
 TileMap tileMap;
 
 
+void solveImpulse(const BodyInfo &info, const Vec2D &pos, Vec2D &spd, double &angSpd,
+    const BodyInfo &info1, const Vec2D &pos1, const Vec2D &norm, const Vec2D &pt, double coeff)
+{
+    double w = (pt - pos) % norm, w1 = (pt - pos1) % norm;
+    double invEffMass = info.invMass + info1.invMass + w * w * info.invAngMass + w1 * w1 * info1.invAngMass;
+    double impulse = coeff / invEffMass;  spd += impulse * info.invMass * norm;  angSpd += impulse * info.invAngMass * w;
+}
+
+template<typename S> double solveCollision(const BodyInfo &info, S &cur,
+    const BodyInfo &info1, const Vec2D &pos1, const Vec2D &norm, const Vec2D &pt, double bounce, double frict)
+{
+    Vec2D relSpd = cur.spd + ~(pt - cur.pos) * cur.angSpd;
+    double normSpd = relSpd * norm;
+    if(normSpd < 0)
+    {
+        frict *= normSpd / sqrt(relSpd.sqr() + spdEps2);
+        solveImpulse(info, cur.pos, cur.spd, cur.angSpd, info1, pos1,  norm, pt, -bounce * normSpd);
+        solveImpulse(info, cur.pos, cur.spd, cur.angSpd, info1, pos1, ~norm, pt, frict * (relSpd % norm));
+    }
+    return normSpd;
+}
+
+
+struct TireState
+{
+    Vec2D pos, spd;
+    double angSpd;
+
+    TireState() = default;
+
+    TireState(const Vec2D &pos_, const Vec2D &dir) : pos(pos_), spd(dir * tireSpeed), angSpd(0)
+    {
+    }
+
+    TireState(const model::Projectile &tire) : pos(tire.getX(), tire.getY()),
+        spd(tire.getSpeedX(), tire.getSpeedY()), angSpd(tire.getAngularSpeed())
+    {
+        assert(tire.getType() == model::TIRE);
+    }
+
+    bool nextStep()
+    {
+        bool hit = false;
+        for(int i = 0; i < physIter; i++)
+        {
+            pos += spd * physDt;
+
+            Vec2D norm;
+            double depth = tileMap.collideBorder(pos, tireRadius, norm);
+            if(depth > 0)
+            {
+                Vec2D pt = pos - norm * tireRadius;
+                solveCollision(tireInfo, *this, borderInfo, pt, norm, pt, bonusBounce, bonusFrict);
+                pos += depth * norm;  hit = true;
+            }
+        }
+        return hit;
+    }
+};
+
+struct TireTrack
+{
+    vector<TireState> track;
+    int firstHit;  long long owner;
+    unsigned flag;
+
+    TireTrack(const model::Projectile &tire, int &index) :
+        firstHit(infTime), owner(tire.getCarId()), flag(1 << (index++ & 31))
+    {
+        TireState cur(tire);
+        for(int time = 0;; time++)
+        {
+            track.push_back(cur);  if(!cur.nextStep())continue;
+            firstHit = min(firstHit, time + 1);  if(cur.spd.sqr() < tireEndSpeed2)break;
+        }
+    }
+};
+
+vector<TireTrack> tireTracks;
+
+void calcTireTracks(const std::vector<model::Projectile> &projs, int &base)
+{
+    tireTracks.clear();
+    for(auto &proj : projs)if(proj.getType() == model::TIRE)
+        tireTracks.emplace_back(proj, base);
+}
+
+
 map<long long, int> lastAlive;
 
 struct CarState
@@ -721,28 +884,6 @@ struct CarState
         nitroEnd = time + nitroDuration;  nitroCount--;  return true;
     }
 };
-
-void solveImpulse(const BodyInfo &info, const Vec2D &pos, Vec2D &spd, double &angSpd,
-    const BodyInfo &info1, const Vec2D &pos1, const Vec2D &norm, const Vec2D &pt, double coeff)
-{
-    double w = (pt - pos) % norm, w1 = (pt - pos1) % norm;
-    double invEffMass = info.invMass + info1.invMass + w * w * info.invAngMass + w1 * w1 * info1.invAngMass;
-    double impulse = coeff / invEffMass;  spd += impulse * info.invMass * norm;  angSpd += impulse * info.invAngMass * w;
-}
-
-double solveCollision(const BodyInfo &info, CarState &car,
-    const BodyInfo &info1, const Vec2D &pos1, const Vec2D &norm, const Vec2D &pt, double bounce, double frict)
-{
-    Vec2D relSpd = car.spd + ~(pt - car.pos) * car.angSpd;
-    double normSpd = relSpd * norm;
-    if(normSpd < 0)
-    {
-        frict *= normSpd / sqrt(relSpd.sqr() + spdEps2);
-        solveImpulse(info, car.pos, car.spd, car.angSpd, info1, pos1,  norm, pt, -bounce * normSpd);
-        solveImpulse(info, car.pos, car.spd, car.angSpd, info1, pos1, ~norm, pt, frict * (relSpd % norm));
-    }
-    return normSpd;
-}
 
 
 struct EnemyState : public CarState
@@ -865,7 +1006,7 @@ struct EnemyTrack
 
 vector<EnemyTrack> enemyTracks;
 
-void calcEnemyTracks(const std::vector<model::Car> &cars, int base)
+void calcEnemyTracks(const std::vector<model::Car> &cars, int &base)
 {
     int enemyCount = 0;
     for(auto &car : cars)if(!car.isTeammate() && !car.isFinishedTrack())enemyCount++;
@@ -926,7 +1067,45 @@ struct AllyState : public CarState
 
     void tryFireTire(int time)
     {
-        // TODO
+        TireState tire[enemyLookahead + 1];
+        int endTime = time;  Box bound(pos);
+        for(TireState cur(pos, dir); endTime <= enemyLookahead; endTime++)
+        {
+            tire[endTime] = cur;
+            if(cur.nextStep() && cur.spd.sqr() < tireEndSpeed2)break;
+            bound.add(cur.pos);
+        }
+        bound.offset(tireRadius);
+
+        double best = 0;
+        for(const auto &track : enemyTracks)if(track.durability > 0)
+        {
+            if(!bound.cross(track.bound))continue;
+
+            int hit[enemyTrackCount] = {infTime, infTime, infTime};
+            for(int t = time + 1; t < endTime; t++)for(int i = 0; i < enemyTrackCount; i++)
+                if(track.pos[t][i].checkCircle(tire[t].pos, tireRadius))hit[i] = min(hit[i], t);
+
+            double minDamage = numeric_limits<double>::infinity();
+            for(int i = 0; i < enemyTrackCount; i++)
+            {
+                double damage = 0;
+                if(hit[i] < infTime && (track.pos[time][i].pos - pos) * dir > 0)
+                {
+                    Vec2D d = Quad(track.pos[hit[i]][i]).collide(tire[hit[i]].pos);
+                    damage = tireDamage * max(0.0, (track.pos[hit[i]][i].spd - tire[hit[i]].spd) * normalize(d));
+                }
+                minDamage = min(minDamage, damage);
+            }
+
+            double durability = track.durability - minDamage;
+            double delta = pow<firePower>(1 - max(0.0, durability)) - pow<firePower>(1 - track.durability);
+            if(durability < 0)delta += 1;  best = max(best, damageScore * delta);
+        }
+        if(fireScore < (best -= ammoCost))
+        {
+            fireTime = time;  fireScore = best;
+        }
     }
 
     void tryOil(int time)
@@ -1025,6 +1204,15 @@ struct AllyState : public CarState
         {
             if(car.pointDist2(washer.pos + time * washer.spd) > washerRadius2)continue;  // TODO: subtick precision
             if((durability -= washerDamage) < 0)return false;  hitFlags |= washer.flag;
+        }
+
+        for(const auto &tire : tireTracks)if((hitFlags & tire.flag) != tire.flag)
+        {
+            if(size_t(time) >= tire.track.size())continue;
+            if(tire.owner == info.carId && time < tire.firstHit)continue;
+            Vec2D d = car.collide(tire.track[time].pos);  if(d.sqr() > tireRadius2)continue;
+            double damage = tireDamage * max(0.0, (spd - tire.track[time].spd) * normalize(d));
+            if((durability -= damage) < 0)return false;  hitFlags |= tire.flag;
         }
 
         if(time < impactLookahead)for(const auto &track : enemyTracks)
@@ -1749,6 +1937,7 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
         globalTick = world.getTick();
 
         int index = tileMap.reset(world, self);
+        calcTireTracks(world.getProjectiles(), index);
         calcEnemyTracks(world.getCars(), index);
     }
 
@@ -1766,19 +1955,16 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
     move.setThrowProjectile(globalTick == 200);
     for(auto &tire : world.getProjectiles())
     {
-        static Vec2D predPos, predSpd;
-        static double predAngle, predAngSpd;
-        Vec2D pos(tire.getX(), tire.getY());
-        Vec2D spd(tire.getSpeedX(), tire.getSpeedY());
-        double angle = tire.getAngle(), angSpd = tire.getAngularSpeed();
+        static TireState pred;
+        TireState cur(tire);
 
-        Vec2D errPos = pos - predPos, errSpd = spd - predSpd;
+        Vec2D errPos = cur.pos - pred.pos, errSpd = cur.spd - pred.spd;
         cout << errPos.x << ' ' << errPos.y << ' ';
         cout << errSpd.x << ' ' << errSpd.y << ' ';
-        cout << (angle - predAngle) << ' ' << (angSpd - predAngSpd) << endl;
+        cout << (cur.angSpd - pred.angSpd) << endl;
 
-        predPos = pos + spd;  predSpd = spd;
-        predAngle = angle + angSpd;  predAngSpd = angSpd;
+        cur.nextStep();
+        pred = cur;
     }
     */
 

@@ -211,13 +211,14 @@ constexpr int impactLookahead = 20;
 constexpr int distPower = 4;
 constexpr double distPenalty = 100;
 constexpr double reversePenalty = 3;
-constexpr double maxBlowSpeed = 3;
-constexpr double pickupDepth = 5;
+constexpr double maxBlowSpeed = 5;
+constexpr double pickupDepth = 10;
 
 constexpr double largeSpeed = 30;
 
 constexpr int optTileDist = 8, allyLookahead = 600;
 constexpr int enemyTrackCount = 3, enemyLookahead = 50;
+constexpr int mutateStep = 12, mutateStages = 16;
 
 constexpr int physIter = 1;
 constexpr double physDt = 1.0 / physIter;
@@ -1362,10 +1363,10 @@ struct Move
     }
 
     template<typename T> bool nextStep(T &handler,
-        const CarInfo &info, AllyState &state, const vector<Event> &events, int time)
+        const CarInfo &info, AllyState &state, int eventCount, int time)
     {
         unsigned old = state.dist;  if(!nextStep(info, state, time))return false;
-        return old == state.dist || handler.evaluate(info, state, events, time + 1);
+        return old == state.dist || handler.evaluate(info, state, eventCount, time + 1);
     }
 
     static void execute(vector<Event> &events, model::Move &move)
@@ -1456,19 +1457,23 @@ struct ProgramState : public Move
     template<typename T> bool process(T &handler, const CarInfo &info, AllyState &state, int &time, int endTime)
     {
         if(time >= endTime)return true;  dumpEvents(state, time);
-        while(time < endTime)if(!nextStep(handler, info, state, events, time++))return false;
+        while(time < endTime)if(!nextStep(handler, info, state, events.size(), time++))return false;
         return true;
     }
 };
 
 template<typename T> void executePlan(T &handler,
-    const CarInfo &info, AllyState state, const vector<Event> &events, int endTime)
+    const CarInfo &info, AllyState state, const vector<Event> &events, int startTime, int endTime)
 {
-    Move cur;  int time = 0, pos = 0;
+    Move cur;  int pos = 0;
+    for(; events[pos].time < startTime; pos++)cur.update(events[pos].type);
+    cur.flags = 0;
+
+    int time = startTime;
     while(time < endTime)
     {
         for(; events[pos].time <= time; pos++)cur.update(events[pos].type);
-        if(cur.nextStep(handler, info, state, events, time++))continue;
+        if(cur.nextStep(handler, info, state, pos, time++))continue;
         handler.finalize(events, 0, time, false);  return;
     }
     handler.finalize(events, 0, time, true);
@@ -1644,7 +1649,7 @@ namespace Program
     }
 
 
-    constexpr int optStep = 20, brakeTime = 20;
+    constexpr int optStep = 2 * mutateStep, brakeTime = 20;
 
     const Bytecode bytecode = start() +
 
@@ -1777,10 +1782,10 @@ struct Optimizer
     {
     }
 
-    bool evaluate(const CarInfo &info, const AllyState &state, const vector<Event> &events, int time)
+    bool evaluate(const CarInfo &info, const AllyState &state, int eventCount, int time)
     {
         assert(state.dist <= optTileDist);
-        last = make_shared<Position>(move(last), time, state, events.size());
+        last = make_shared<Position>(move(last), time, state, eventCount);
         return state.dist < optTileDist;
     }
 
@@ -1805,13 +1810,61 @@ struct Optimizer
         ::executeProgram(*this, program[type], info, last->state, cur, 0, programDuration[type]);
     }
 
+    void mutate(const CarInfo &info, const Plan &plan, double factor, double turn)
+    {
+        int start = int(plan.time * factor);
+        int turnTarget = 0, turnTime = 0, pos = 0;
+        vector<Event> events;  events.reserve(plan.events.size());
+        for(; plan.events[pos].time <= start; pos++)
+        {
+            if(plan.events[pos].type >= e_left && plan.events[pos].type <= e_right)
+            {
+                turn += limit(turnTarget - turn, (plan.events[pos].time - turnTime) * turnChange);
+                turnTarget = plan.events[pos].type - e_center;  turnTime = plan.events[pos].time;
+            }
+            events.push_back(plan.events[pos]);
+        }
+
+        int change = infTime, offset = 0;
+        int p = plan.time - start, q = p + mutateStep;
+        for(; plan.events[pos].time < plan.time; pos++)
+        {
+            int time = plan.events[pos].time + offset - start;
+            int tMin = (time * p + q - 1) / q, tMax = time * q / p;
+            time = start + tMin + rand() % (tMax - tMin + 1);
+
+            if(plan.events[pos].type >= e_left && plan.events[pos].type <= e_right)
+            {
+                int nextTurn = plan.events[pos].type - e_center;
+                int turnEnd = turnTime + int(abs(turn) * invTurnChange + timeEps);
+                if(time < turnEnd && ((signbit(turn) ? -max(turnTarget, nextTurn) : min(turnTarget, nextTurn)) < 0))
+                    time = 2 * turnEnd - time;
+
+                turn += limit(turnTarget - turn, (plan.events[pos].time - turnTime) * turnChange);
+                turnTarget = nextTurn;  turnTime = plan.events[pos].time;
+            }
+            if(time != plan.events[pos].time)
+                change = min(change, min(time, plan.events[pos].time));
+            offset = time - plan.events[pos].time;  // TODO: double for incomplete
+
+            auto iter = events.end();
+            while(iter != events.begin() && (iter - 1)->time > time)iter--;
+            events.insert(iter, Event(time, plan.events[pos].type));
+        }
+        if(change >= infTime)return;
+
+        events.emplace_back(infTime, e_end);  auto ptr = &plan.last;
+        while((*ptr)->time > change)ptr = &(*ptr)->prev;  last = *ptr;
+        executePlan(*this, info, (*ptr)->state, events, (*ptr)->time, plan.time + offset);
+    }
+
     void process(const model::Car &car)
     {
         const CarInfo &info = carInfo[car.getType()];
 
         best.clear();  startLeafDist = -optTileDist;  assert(!last);
         last = make_shared<Position>(move(last), 0, AllyState(car, oldAngSpd), 0);
-        executePlan(*this, info, last->state, old.events, old.time);
+        executePlan(*this, info, last->state, old.events, 0, old.time);
 
         startLeafDist = 0;
         ProgramState cur(info, last->state, {Event(infTime, e_end)}, 0);
@@ -1850,6 +1903,20 @@ struct Optimizer
                 ::executeProgram(*this, program[type], info,
                     last->state, cur, last->time, last->time + programDuration[type]);
             }
+        }
+        for(int i = 0; i < mutateStages; i++)
+        {
+            double score = tileScore;  Plan *sel = nullptr;
+            for(auto &track : best)if(score < track.second.score)
+            {
+                score = track.second.score;  sel = &track.second;
+            }
+            if(!sel)break;
+
+            mutate(info, *sel, 0.75, car.getWheelTurn());
+            mutate(info, *sel, 0.50, car.getWheelTurn());
+            mutate(info, *sel, 0.25, car.getWheelTurn());
+            mutate(info, *sel, 0.00, car.getWheelTurn());
         }
         last.reset();
     }

@@ -1114,12 +1114,12 @@ struct AllyState : public CarState
         Vec2D slick = pos - slickOffset * dir;  double best = -oilCost;
         for(const auto &track : enemyTracks)
         {
-            if(!track.bound.offset(slickRadius).cross(slick))continue;
+            if(!track.bound.offset(slickRadius - carRadius).cross(slick))continue;
 
             int hit = 0;
             for(int t = time + 1; t <= enemyLookahead; t++)
                 for(int i = 0, flag = 1; i < enemyTrackCount; i++, flag <<= 1)
-                    if(track.pos[t][i].checkCircle(slick, slickRadius))hit |= flag;
+                    if((track.pos[t][i].pos - slick).sqr() < sqr(slickRadius - pickupDepth))hit |= flag;
 
             if(hit == 7)best += slickScore * track.speed;
         }
@@ -1196,7 +1196,7 @@ struct AllyState : public CarState
 
         if(time >= slidingEnd)for(const auto &slick : tileMap.slicks[state.cell])
         {
-            if(car.pointDist2(slick.pos) > slickRadius2)continue;
+            if((car.pos - slick.pos).sqr() > slickRadius2)continue;
             slidingEnd = min(time + slidingTime, slick.endTime);
             score -= slickPenalty;
         }

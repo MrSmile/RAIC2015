@@ -416,12 +416,15 @@ struct Washer
 template<typename T> void addToCells(T &&item, vector<vector<T>> &map, double border)
 {
     Vec2D offs = item.pos * invTileSize;
-    int x = int(offs.x), y = int(offs.y), k = y * mapLine + x;  offs -= Vec2D(x, y);
-    if(x >             0 && offs.x <     border)map[k -       1].push_back(item);
-    if(x < mapWidth  - 1 && offs.x > 1 - border)map[k +       1].push_back(item);
-    if(y >             0 && offs.y <     border)map[k - mapLine].push_back(item);
-    if(y < mapHeight - 1 && offs.y > 1 - border)map[k + mapLine].push_back(item);
-    map[k].push_back(move(item));
+    int x = min(int(offs.x), mapWidth  - 1);
+    int y = min(int(offs.y), mapHeight - 1);
+
+    int cell = y * mapLine + x;  offs -= Vec2D(x, y);
+    if(x >             0 && offs.x <     border)map[cell -       1].push_back(item);
+    if(x < mapWidth  - 1 && offs.x > 1 - border)map[cell +       1].push_back(item);
+    if(y >             0 && offs.y <     border)map[cell - mapLine].push_back(item);
+    if(y < mapHeight - 1 && offs.y > 1 - border)map[cell + mapLine].push_back(item);
+    map[cell].push_back(move(item));
 }
 
 struct TileMap

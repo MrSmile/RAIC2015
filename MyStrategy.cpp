@@ -198,7 +198,7 @@ constexpr double timeEps = 0.001;
 constexpr double spdEps2 = 1e-12;
 
 constexpr double tileToggle = 0.49;
-constexpr double tileScore = 100000;
+constexpr double tileScore = 1000;
 
 constexpr double pickupScore = 5;
 constexpr double ammoCost = 50, nitroCost = 50, oilCost = 50, scoreBonus = 500;
@@ -216,9 +216,9 @@ constexpr double pickupDepth = 10;
 
 constexpr double largeSpeed = 30;
 
-constexpr int optTileDist = 8, allyLookahead = 600;
+constexpr int optTileDist = 8 * 256, allyLookahead = 600;
 constexpr int enemyTrackCount = 3, enemyLookahead = 50;
-constexpr int mutateStep = 12, mutateStages = 16;
+constexpr int mutateStep = 16, mutateStages = 16;
 
 constexpr int physIter = 1;
 constexpr double physDt = 1.0 / physIter;
@@ -228,7 +228,7 @@ constexpr int infTime = numeric_limits<int>::max();
 constexpr BodyInfo borderInfo = {0, 0};
 
 double tileSize, invTileSize, tileMargin;
-int mapWidth, mapHeight, mapLine;
+int mapWidth, mapHeight, mapLine, mapSize, lapCount;
 
 int breakDuration;
 int nitroDuration, nitroCooldown;
@@ -263,7 +263,9 @@ void initConsts(const model::Game &game, const model::World &world)
     tileSize = game.getTrackTileSize();  invTileSize = 1 / tileSize;
     tileMargin = game.getTrackTileMargin();
 
-    mapWidth = world.getWidth();  mapHeight = world.getHeight();  mapLine = mapWidth + 1;
+    mapWidth = world.getWidth();  mapHeight = world.getHeight();
+    mapLine = mapWidth + 1;  mapSize = mapHeight * mapLine;
+    lapCount = game.getLapCount();
 
     breakDuration = game.getCarReactivationTimeTicks();
     nitroDuration = game.getNitroDurationTicks();
@@ -424,9 +426,21 @@ template<typename T> void addToCells(T &&item, vector<vector<T>> &map, double bo
 
 struct TileMap
 {
+    struct Waypoint
+    {
+        int cell;  bool finish;
+
+        Waypoint(int cell_, bool finish_) : cell(cell_), finish(finish_)
+        {
+        }
+    };
+
+    array<int, 4> borderOffs, mapOffs;
+    int waypointCount;
+
     vector<bool> borders;
-    vector<int> waypoints;
-    vector<vector<unsigned>> distMap;
+    vector<Waypoint> waypoints;
+    vector<unsigned> distMap;
     vector<vector<Bonus>> bonuses;
     vector<vector<Slick>> slicks;
     vector<Washer> washers;
@@ -434,6 +448,9 @@ struct TileMap
     void init(const model::World &world)
     {
         const int line = 2 * mapLine;
+        borderOffs = {line + 1, 2, line + 3, line + 2};
+        mapOffs = {-1, -mapLine, 1, mapLine};
+
         borders.resize(line * (mapHeight + 2), false);
         for(int x = 0, k1 = 2, k2 = line * mapHeight + 2; x < mapWidth; x++, k1 += 2, k2 += 2)
             borders[k1] = borders[k2] = true;
@@ -442,8 +459,8 @@ struct TileMap
 
         enum TileFlags
         {
-            f_l = 1, f_r = 2, f_u = 4, f_d = 8,
-            f_all = f_l | f_r | f_u | f_d
+            f_l = 1, f_u = 2, f_r = 4, f_d = 8,
+            f_all = f_l | f_u | f_r | f_d
         };
 
         constexpr int tile[] =
@@ -466,33 +483,27 @@ struct TileMap
         const vector<vector<model::TileType>> &map = world.getTilesXY();
         for(int x = 0; x < mapWidth; x++)for(int y = 0; y < mapHeight; y++)
         {
-            int flags = tile[map[x][y]];
-            int pos = (y + 1) * line + 2 * (x + 1);
-            if(flags & f_l)borders[pos -    1] = true;
-            if(flags & f_r)borders[pos +    1] = true;
-            if(flags & f_u)borders[pos - line] = true;
-            if(flags & f_d)borders[pos +    0] = true;
+            int flags = tile[map[x][y]], cell = y * mapLine + x;
+            for(int i = 0; i < 4; i++)if(flags & (1 << i))borders[2 * cell + borderOffs[i]] = true;
         }
 
         /*
         for(int x = 0; x < mapWidth; x++)for(int y = 0; y < mapHeight; y++)
         {
-            int flags = 0;
-            int pos = (y + 1) * line + 2 * (x + 1);
-            if(borders[pos -    1])flags |= f_l;
-            if(borders[pos +    1])flags |= f_r;
-            if(borders[pos - line])flags |= f_u;
-            if(borders[pos +    0])flags |= f_d;
+            int flags = 0, cell = y * mapLine + x;
+            for(int i = 0; i < 4; i++)if(borders[2 * cell + borderOffs[i]])flags |= 1 << i;
             assert(flags == tile[map[x][y]]);
         }
         */
 
         const vector<vector<int>> &wpts = world.getWaypoints();
-        waypoints.reserve(wpts.size());  distMap.resize(wpts.size());
-        for(auto &&pt : wpts)waypoints.push_back(pt[1] * mapLine + pt[0]);
+        waypoints.reserve((waypointCount = wpts.size()) * lapCount + 1);
+        for(int i = 0; i < lapCount; i++)for(auto &pt : wpts)
+            waypoints.emplace_back(pt[1] * mapLine + pt[0], &pt == &wpts[0]);
+        waypoints.push_back(waypoints[0]);
 
-        bonuses.resize(mapHeight * mapLine);
-        slicks.resize(mapHeight * mapLine);
+        distMap.resize(12 * mapSize * wpts.size() * lapCount, -1);
+        bonuses.resize(mapSize);  slicks.resize(mapSize);
     }
 
     int reset(const model::World &world, const model::Car &self)
@@ -513,32 +524,83 @@ struct TileMap
         return index;
     }
 
-    static void pathfinderUpdate(vector<unsigned> &map, vector<int> &queue, int pos, unsigned dist)
+    struct Segment
     {
-        if(map[pos] <= dist)return;  map[pos] = dist;  queue.push_back(pos);
-    }
+        int waypoint, cell, type;
+        unsigned dist;
 
-    const vector<unsigned> &waypointDistMap(int index)
-    {
-        vector<unsigned> &map = distMap[index];  if(map.size())return map;
-
-        const int line = 2 * mapLine;
-        vector<int> queue, next;  queue.push_back(waypoints[index]);
-        map.resize(mapHeight * mapLine, -1);  map[waypoints[index]] = 0;
-        for(unsigned dist = 1; queue.size(); dist++)
+        Segment(int waypoint_, int cell_, int type_, unsigned dist_) :
+            waypoint(waypoint_), cell(cell_), type(type_), dist(dist_)
         {
-            for(int k : queue)
-            {
-                int p = 2 * k + line + 2;
-                if(!borders[p -    1])pathfinderUpdate(map, next, k -       1, dist);
-                if(!borders[p +    1])pathfinderUpdate(map, next, k +       1, dist);
-                if(!borders[p - line])pathfinderUpdate(map, next, k - mapLine, dist);
-                if(!borders[p +    0])pathfinderUpdate(map, next, k + mapLine, dist);
-            }
-            queue.clear();  swap(queue, next);
         }
-        return map;
+
+        bool operator < (const Segment &seg) const
+        {
+            return dist > seg.dist;
+        }
+    };
+
+    void updateQueue(vector<Segment> &queue,
+        int waypoint, int cell, int type, unsigned dist, const unsigned segDist[])
+    {
+        dist += segDist[type >> 2];
+        int id = 12 * (waypoint * mapSize + cell) + type;
+        if(distMap[id] <= dist)return;  distMap[id] = dist;
+
+        if(borders[2 * cell + borderOffs[type & 3]])return;
+        if(cell + mapOffs[type & 3] == waypoints[waypoint + 1].cell)return;
+        queue.emplace_back(waypoint, cell, type, dist);
+        push_heap(queue.begin(), queue.end());
     }
+
+    void generateSegments(vector<Segment> &queue,
+        int waypoint, int cell, int type, unsigned dist, const unsigned segDist[])
+    {
+        updateQueue(queue, waypoint, cell, ((type + 1) & 3) | 0, dist, segDist);
+        updateQueue(queue, waypoint, cell, ((type + 0) & 3) | 4, dist, segDist);
+        updateQueue(queue, waypoint, cell, ((type + 3) & 3) | 8, dist, segDist);
+    }
+
+    void calcDistMap()
+    {
+        constexpr unsigned segDist[3][3] =
+        {
+            {512, 256, 181}, {256, 256, 256}, {181, 256, 512}
+        };
+        constexpr unsigned segDistRev[3][3] =
+        {
+            {256, 768, 1024}, {768, 1024, 768}, {1024, 768, 256}
+        };
+        constexpr unsigned segDistStart[3] = {91, 128, 91};
+
+        vector<Segment> queue;
+        int waypoint = waypoints.size() - 2, cell = waypoints.rbegin()->cell;
+        for(int i = 0; i < 4; i++)if(!borders[2 * cell + borderOffs[i]])
+            generateSegments(queue, waypoint, cell + mapOffs[i], i, 0, segDistStart);
+
+        while(queue.size())
+        {
+            Segment seg = queue[0];  pop_heap(queue.begin(), queue.end());  queue.pop_back();
+
+            int prev = seg.cell + mapOffs[seg.type & 3];
+            generateSegments(queue, seg.waypoint, prev, seg.type, seg.dist, segDist[seg.type >> 2]);
+            if(seg.cell == waypoints[seg.waypoint].cell && seg.waypoint)
+                generateSegments(queue, seg.waypoint - 1, prev, seg.type, seg.dist, segDist[seg.type >> 2]);
+
+            generateSegments(queue, seg.waypoint, seg.cell, seg.type + 2, seg.dist, segDistRev[seg.type >> 2]);
+            if(prev == waypoints[seg.waypoint].cell && seg.waypoint)
+                generateSegments(queue, seg.waypoint - 1, seg.cell, seg.type + 2, seg.dist, segDistRev[seg.type >> 2]);
+        }
+    }
+
+    unsigned calcDist(int waypoint, int cell, const Vec2D &offs, const Vec2D &dir, const Vec2D &spd)
+    {
+        constexpr unsigned segDistStart[3] = {91, 128, 91};
+        int base = 12 * (waypoint * mapSize + cell);  unsigned dist = -1;
+        for(int i = 0; i < 12; i++)dist = min(dist, distMap[base + i] - segDistStart[i >> 2]);  // TODO: precision
+        return dist;
+    }
+
 
     enum SymmetryFlags
     {
@@ -805,7 +867,25 @@ void calcTireTracks(const std::vector<model::Projectile> &projs, int &base)
 }
 
 
-map<long long, int> lastAlive;
+struct CarData
+{
+    int lastAlive, waypoint;
+
+    CarData() : lastAlive(0), waypoint(1)
+    {
+    }
+};
+
+map<long long, CarData> carData;
+
+int getCarWaypoint(const model::Car &car)
+{
+    auto &data = carData[car.getId()];
+    int waypoint = car.getNextWaypointIndex();
+    while(waypoint < data.waypoint)waypoint += tileMap.waypointCount;
+    return data.waypoint = waypoint;
+}
+
 
 struct CarState
 {
@@ -835,9 +915,9 @@ struct CarState
 
         if(durability > 0)
         {
-            breakEnd = 0;  lastAlive[car.getId()] = globalTick;
+            breakEnd = 0;  carData[car.getId()].lastAlive = globalTick;
         }
-        else breakEnd = lastAlive[car.getId()] + breakDuration - globalTick;
+        else breakEnd = carData[car.getId()].lastAlive + breakDuration - globalTick;
     }
 
     template<typename T, typename S> bool nextStep(S &state,
@@ -1022,7 +1102,7 @@ void calcEnemyTracks(const std::vector<model::Car> &cars, int &base)
 
 struct AllyState : public CarState
 {
-    int waypoint;
+    int waypoint, cell;
     unsigned base, dist;
     unsigned hitFlags;
     double score;
@@ -1136,16 +1216,6 @@ struct AllyState : public CarState
         if(oilCount && time >= oilReady)tryOil(time);
     }
 
-    AllyState(const model::Car &car, double prevAngSpd = 0) :
-        CarState(car, prevAngSpd), dist(0), hitFlags(0), score(0)
-    {
-        Vec2D offs = pos * invTileSize;  int k = int(offs.y) * mapLine + int(offs.x);
-        base = tileMap.waypointDistMap(waypoint = car.getNextWaypointIndex())[k];
-
-        fireTime = oilTime = infTime;  fireScore = oilScore = 0;
-        useBonuses(car.getType() == model::JEEP, 0);
-    }
-
     struct StepState
     {
         double borderDist;
@@ -1156,12 +1226,28 @@ struct AllyState : public CarState
         {
         }
 
+        static Vec2D calcCell(const Vec2D &pos, int &cell)
+        {
+            Vec2D offs = pos * invTileSize;  int x = int(offs.x), y = int(offs.y);
+            cell = y * mapLine + x;  return offs - Vec2D(x + 0.5, y + 0.5);
+        }
+
         void calcCell(const Vec2D &pos)
         {
-            offs = pos * invTileSize;  int x = int(offs.x), y = int(offs.y);
-            cell = y * mapLine + x;  offs -= Vec2D(x + 0.5, y + 0.5);
+            offs = calcCell(pos, cell);
         }
     };
+
+    AllyState(const model::Car &car, double prevAngSpd = 0) :
+        CarState(car, prevAngSpd), dist(0), hitFlags(0), score(0)
+    {
+        waypoint = getCarWaypoint(car);
+        Vec2D offs = StepState::calcCell(pos, cell);
+        base = tileMap.calcDist(waypoint - 1, cell, offs, dir, spd);
+
+        fireTime = oilTime = infTime;  fireScore = oilScore = 0;
+        useBonuses(car.getType() == model::JEEP, 0);
+    }
 
     bool collide(const CarInfo &info, Quad &car, int time, StepState &state)
     {
@@ -1257,15 +1343,19 @@ struct AllyState : public CarState
         if(powerTarget < 1)score -= reversePenalty;
         useBonuses(info.jeep, time + 1);
 
-        if(abs(state.offs.x) > tileToggle || abs(state.offs.y) > tileToggle)return true;
-        unsigned cur = tileMap.distMap[waypoint][state.cell];  if(cur + dist >= base)return true;
-        dist = base - cur;  score += tileScore;  if(cur)return true;
-
-        if(size_t(++waypoint) >= tileMap.waypoints.size())  // TODO: detect finish
+        if(state.cell == cell || abs(state.offs.x) > tileToggle || abs(state.offs.y) > tileToggle)return true;
+        if(state.cell == tileMap.waypoints[waypoint].cell && tileMap.waypoints[waypoint++].finish)
         {
-            nitroCount++;  ammoCount++;  oilCount++;  waypoint = 0;
+            if(size_t(waypoint) >= tileMap.waypoints.size())  // finish
+            {
+                score -= nitroCount * nitroCost + ammoCount * ammoCost + oilCount * oilCost;
+                dist = optTileDist;  return true;
+            }
+            nitroCount++;  ammoCount++;  oilCount++;
         }
-        base += tileMap.waypointDistMap(waypoint)[state.cell];  return true;
+        unsigned cur = tileMap.calcDist(waypoint - 1, cell = state.cell, state.offs, dir, spd);
+        if(cur + dist >= base)return cur + dist < base + optTileDist;
+        dist = base - cur;  return true;
     }
 
     static int classify(Vec2D vec)
@@ -1288,7 +1378,7 @@ struct AllyState : public CarState
 
     double calcScore(int time) const
     {
-        return score + fireScore + oilScore - time;
+        return score + dist * tileScore + fireScore + oilScore - time;
     }
 };
 
@@ -1733,16 +1823,24 @@ struct Plan
         events.emplace_back(infTime, e_end);
     }
 
-    void set(const vector<Event> &base, const shared_ptr<Position> &pos)
+    bool update(const vector<Event> &base, const shared_ptr<Position> &pos)
     {
-        last = pos;
+        double newScore = pos->state.calcScore(pos->time);
+        if(pos->state.dist > optTileDist)
+        {
+            const shared_ptr<Position> &prev = pos->prev;
+            double tail = (pos->state.dist - optTileDist) / double(pos->state.dist - prev->state.dist);
+            newScore -= (newScore - prev->state.calcScore(prev->time)) * tail;
+        }
+        if(newScore < score)return false;
+
+        last = pos;  time = pos->time;
         fireTime = pos->state.fireTime;  oilTime = pos->state.oilTime;
         tileDist = pos->state.dist;  leafDist = pos->leafDist;
-        score = pos->state.calcScore(time = pos->time);
 
         events.clear();  events.reserve(pos->eventCount + 1);
         events.insert(events.begin(), base.begin(), base.begin() + pos->eventCount);
-        events.emplace_back(infTime, e_end);
+        events.emplace_back(infTime, e_end);  score = newScore;  return true;
     }
 
     void print() const
@@ -1784,7 +1882,6 @@ struct Optimizer
 
     bool evaluate(const CarInfo &info, const AllyState &state, int eventCount, int time)
     {
-        assert(state.dist <= optTileDist);
         last = make_shared<Position>(move(last), time, state, eventCount);
         return state.dist < optTileDist;
     }
@@ -1795,9 +1892,7 @@ struct Optimizer
         for(; (*pos)->time > startTime; pos = &(*pos)->prev, leafDist++)
         {
             (*pos)->leafDist = max(leafDist, (*pos)->leafDist);
-
-            Plan &track = best[(*pos)->state.classify()];
-            if((*pos)->state.score > track.score)track.set(events, *pos);
+            best[(*pos)->state.classify()].update(events, *pos);
         }
         last = *pos;  pos = &last;
         for(; (*pos); pos = &(*pos)->prev, leafDist++)
@@ -1926,19 +2021,17 @@ struct Optimizer
         Vec2D pos(car.getX(), car.getY()), dir = sincos(car.getAngle());
         Vec2D spd(car.getSpeedX(), car.getSpeedY());
 
-        Vec2D offs = pos * invTileSize;
-        int x = int(offs.x), y = int(offs.y), k = y * mapLine + x;
-        const vector<unsigned> &map = tileMap.distMap[car.getNextWaypointIndex()];
+        int waypoint = getCarWaypoint(car) - 1, cell;
+        Vec2D offs = AllyState::StepState::calcCell(pos, cell), target(0, 0);
+        int base = 12 * (waypoint * mapSize + cell) + 4;  unsigned dist = -1;
+        for(int i = 0; i < 4; i++)if(dist > tileMap.distMap[base + i])
+        {
+            dist = tileMap.distMap[base + i];  target = {0, 0};
+            (i & 1 ? target.y : target.x) = (i & 2 ? -1 : 1);
+        }
 
-        unsigned dist = map[k];  Vec2D target;
-        const int line = 2 * mapLine;  int p = 2 * k + line + 2;
-        if(!tileMap.borders[p -    1] && map[k -       1] < dist)target = {-1, 0};
-        if(!tileMap.borders[p +    1] && map[k +       1] < dist)target = {+1, 0};
-        if(!tileMap.borders[p - line] && map[k - mapLine] < dist)target = {0, -1};
-        if(!tileMap.borders[p +    0] && map[k + mapLine] < dist)target = {0, +1};
-
-        offs -= Vec2D(x + 0.5, y + 0.5);  double dot = dir * target;
-        constexpr double forward = sqrt(0.75), turnCoeff = sqrt(0.25);
+        double dot = dir * target;
+        constexpr double forward = sqrt(0.5), turnCoeff = sqrt(0.5);
         if(dot > forward)
         {
             move.setEnginePower(1);
@@ -1999,7 +2092,7 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
         if(globalTick < 0)
         {
             initConsts(game, world);  srand(game.getRandomSeed());
-            tileMap.init(world);
+            tileMap.init(world);  tileMap.calcDistMap();
         }
         globalTick = world.getTick();
 

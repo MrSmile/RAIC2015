@@ -201,7 +201,7 @@ constexpr double tileToggle = 0.49;
 constexpr double tileScore = 1000;
 
 constexpr double pickupScore = 5;
-constexpr double ammoCost = 50, nitroCost = 50, oilCost = 50, scoreBonus = 500;
+constexpr double ammoCost = 20, nitroCost = 20, oilCost = 20, scoreBonus = 200;
 constexpr int repairPower = 2, firePower = 2;
 constexpr double damagePenalty = 100, damageScore = 500;
 constexpr double slickPenalty = 50, slickScore = 2;
@@ -804,6 +804,21 @@ template<typename S> double solveCollision(const BodyInfo &info, S &cur,
     return normSpd;
 }
 
+template<typename S, typename S1> double solveCollision(const BodyInfo &info, S &cur,
+    const BodyInfo &info1, const S1 &cur1, const Vec2D &norm, const Vec2D &pt, double bounce, double frict)
+{
+    Vec2D relSpd = cur.spd + ~(cur.pos - pt) * cur.angSpd;
+    relSpd -= cur1.spd + ~(cur1.pos - pt) * cur.angSpd;
+    double normSpd = relSpd * norm;
+    if(normSpd < 0)
+    {
+        frict *= normSpd / sqrt(relSpd.sqr() + spdEps2);
+        solveImpulse(info, cur.pos, cur.spd, cur.angSpd, info1, cur1.pos,  norm, pt, -bounce * normSpd);
+        solveImpulse(info, cur.pos, cur.spd, cur.angSpd, info1, cur1.pos, ~norm, pt, frict * (relSpd % norm));
+    }
+    return normSpd;
+}
+
 
 struct TireState
 {
@@ -861,6 +876,7 @@ struct TireTrack
         firstHit(infTime), owner(tire.getCarId()), flag(1 << (index++ & 31))
     {
         TireState cur(tire);
+        if(cur.spd.sqr() < sqr(tireSpeed) - 1e-3)firstHit = 0;
         for(int time = 0;; time++)
         {
             track.push_back(cur);  if(!cur.nextStep())continue;
@@ -1315,8 +1331,15 @@ struct AllyState : public CarState
         {
             if(size_t(time) >= tire.track.size())continue;
             if(tire.owner == info.carId && time < tire.firstHit)continue;
-            Vec2D d = car.collide(tire.track[time].pos);  if(d.sqr() > tireRadius2)continue;
-            double damage = tireDamage * max(0.0, (spd - tire.track[time].spd) * normalize(d));
+
+            Vec2D norm = -car.collide(tire.track[time].pos);
+            double len = norm.len(), depth = tireRadius - len;
+            state.borderDist = min(state.borderDist, -depth);
+            if(depth < 0)continue;
+
+            norm /= len;  Vec2D pt = tire.track[time].pos + (tireRadius - depth) * norm;
+            double normSpd = solveCollision(info, *this, tireInfo, tire.track[time], norm, pt, bonusBounce, bonusFrict);
+            double damage = tireDamage * max(0.0, normSpd);  pos += 0.5 * depth * norm;
             if((durability -= damage) < 0)return false;  hitFlags |= tire.flag;
         }
 

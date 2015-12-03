@@ -881,22 +881,32 @@ void calcTireTracks(const std::vector<model::Projectile> &projs, int &base)
 
 struct CarData
 {
-    int lastAlive, waypoint;
+    double dirSpd, angSpd;
+    int lastSeen, lastAlive, breakEnd, waypoint;
 
-    CarData() : lastAlive(0), waypoint(1)
+    CarData() : dirSpd(0), lastSeen(0), lastAlive(0), waypoint(1)
     {
+    }
+
+    void update(const model::Car &car)
+    {
+        if(lastSeen + 1 == globalTick)
+            angSpd = car.getAngularSpeed() - carRotFactor * car.getWheelTurn() * dirSpd;
+        else angSpd = 0;  lastSeen = globalTick;
+        dirSpd = Vec2D(car.getSpeedX(), car.getSpeedY()) * sincos(car.getAngle());
+
+        if(car.getDurability() > 0)
+        {
+            breakEnd = globalTick;  lastAlive = globalTick;
+        }
+        else breakEnd = lastAlive + breakDuration;
+
+        int old = waypoint;  waypoint = car.getNextWaypointIndex();
+        while(waypoint < old)waypoint += tileMap.waypointCount;
     }
 };
 
 map<long long, CarData> carData;
-
-int getCarWaypoint(const model::Car &car)
-{
-    auto &data = carData[car.getId()];
-    int waypoint = car.getNextWaypointIndex();
-    while(waypoint < data.waypoint)waypoint += tileMap.waypointCount;
-    return data.waypoint = waypoint;
-}
 
 
 struct CarState
@@ -910,9 +920,9 @@ struct CarState
 
     CarState() = default;
 
-    CarState(const model::Car &car, double prevAngSpd = 0) :
+    CarState(const model::Car &car) :
         pos(car.getX(), car.getY()), spd(car.getSpeedX(), car.getSpeedY()),
-        dir(sincos(car.getAngle())), angle(car.getAngle()), angSpd(prevAngSpd)
+        dir(sincos(car.getAngle())), angle(car.getAngle())
     {
         slidingEnd = car.getRemainingOiledTicks();
         nitroEnd = car.getRemainingNitroCooldownTicks() - nitroCooldown;
@@ -925,11 +935,8 @@ struct CarState
         power = car.getEnginePower();
         turn = car.getWheelTurn();
 
-        if(durability > 0)
-        {
-            breakEnd = 0;  carData[car.getId()].lastAlive = globalTick;
-        }
-        else breakEnd = carData[car.getId()].lastAlive + breakDuration - globalTick;
+        const auto &data = carData[car.getId()];
+        angSpd = data.angSpd;  breakEnd = data.breakEnd - globalTick;
     }
 
     template<typename T, typename S> bool nextStep(S &state,
@@ -1250,10 +1257,9 @@ struct AllyState : public CarState
         }
     };
 
-    AllyState(const model::Car &car, double prevAngSpd = 0) :
-        CarState(car, prevAngSpd), dist(0), hitFlags(0), score(0)
+    AllyState(const model::Car &car) : CarState(car), dist(0), hitFlags(0), score(0)
     {
-        waypoint = getCarWaypoint(car);
+        waypoint = carData[car.getId()].waypoint;
         Vec2D offs = StepState::calcCell(pos, cell);
         base = tileMap.calcDist(waypoint - 1, cell, offs, dir, spd);
 
@@ -1881,14 +1887,14 @@ struct Plan
 
 struct Optimizer
 {
-    Plan old;  double oldAngSpd;
+    Plan old;
     unordered_map<int, Plan> best;
     shared_ptr<Position> last;
     int startLeafDist;
     vector<Plan> buf;
     int lastGood;
 
-    Optimizer() : oldAngSpd(0), lastGood(numeric_limits<int>::min())
+    Optimizer() : lastGood(numeric_limits<int>::min())
     {
     }
 
@@ -1969,8 +1975,8 @@ struct Optimizer
     {
         const CarInfo &info = carInfo[car.getType()];
 
-        best.clear();  startLeafDist = -optTileDist;  assert(!last);
-        last = make_shared<Position>(move(last), 0, AllyState(car, oldAngSpd), 0);
+        best.clear();  startLeafDist = -optTileDist;
+        assert(!last);  last = make_shared<Position>(move(last), 0, car, 0);
         executePlan(*this, info, last->state, old.events, 0, old.time);
 
         startLeafDist = 0;
@@ -2033,7 +2039,7 @@ struct Optimizer
         Vec2D pos(car.getX(), car.getY()), dir = sincos(car.getAngle());
         Vec2D spd(car.getSpeedX(), car.getSpeedY());
 
-        int waypoint = getCarWaypoint(car) - 1, cell;
+        int waypoint = carData[car.getId()].waypoint - 1, cell;
         Vec2D offs = AllyState::StepState::calcCell(pos, cell), target(0, 0);
         int base = 12 * (waypoint * mapSize + cell) + 4;  unsigned dist = -1;
         for(int i = 0; i < 4; i++)if(dist > tileMap.distMap[base + i])
@@ -2088,8 +2094,6 @@ struct Optimizer
             }
             else old.execute(move);
         }
-
-        // TODO: update oldAngSpd
     }
 };
 
@@ -2107,6 +2111,8 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
             tileMap.init(world);  tileMap.calcDistMap();
         }
         globalTick = world.getTick();
+
+        for(auto &car : world.getCars())carData[car.getId()].update(car);
 
         int index = tileMap.reset(world, self);
         calcTireTracks(world.getProjectiles(), index);

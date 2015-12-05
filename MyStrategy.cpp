@@ -439,10 +439,13 @@ struct TileMap
     };
 
     array<int, 4> borderOffs, mapOffs;
-    int waypointCount;
 
-    vector<bool> borders;
+    vector<bool> borders, visited;
+    int unknownCount;
+
+    int waypointCount;
     vector<Waypoint> waypoints;
+
     vector<unsigned> distMap;
     vector<vector<Bonus>> bonuses;
     vector<vector<Slick>> slicks;
@@ -455,11 +458,52 @@ struct TileMap
         mapOffs = {-1, -mapLine, 1, mapLine};
 
         borders.resize(line * (mapHeight + 2), false);
+        visited.resize(line * (mapHeight + 2), false);
         for(int x = 0, k1 = 2, k2 = line * mapHeight + 2; x < mapWidth; x++, k1 += 2, k2 += 2)
-            borders[k1] = borders[k2] = true;
+            borders[k1] = borders[k2] = visited[k1] = visited[k2] = true;
         for(int y = 0, k1 = line + 1, k2 = 2 * line - 1; y < mapHeight; y++, k1 += line, k2 += line)
-            borders[k1] = borders[k2] = true;
+            borders[k1] = borders[k2] = visited[k1] = visited[k2] = true;
+        unknownCount = 2 * mapWidth * mapHeight - mapWidth - mapHeight;
 
+        const vector<vector<int>> &wpts = world.getWaypoints();
+        waypoints.reserve((waypointCount = wpts.size()) * lapCount + 1);
+        for(int i = 0; i < lapCount; i++)for(auto &pt : wpts)
+            waypoints.emplace_back(pt[1] * mapLine + pt[0], &pt == &wpts[0]);
+        waypoints.push_back(waypoints[0]);
+
+        distMap.resize(12 * mapSize * wpts.size() * lapCount);
+        bonuses.resize(mapSize);  slicks.resize(mapSize);
+    }
+
+    const char *horzBorder(int pos) const
+    {
+        if(borders[pos])return "---";  if(visited[pos])return "   ";  return " ? ";
+    }
+
+    char vertBorder(int pos) const
+    {
+        if(borders[pos])return '|';  if(visited[pos])return ' ';  return '?';
+    }
+
+    void print() const
+    {
+        int pos = 2;
+        for(int x = 0; x < mapWidth; x++, pos += 2)cout << '*' << horzBorder(pos);
+        cout << '*' << endl;
+
+        for(int y = 0; y < mapHeight; y++)
+        {
+            for(int x = 0; x < mapWidth; x++)cout << vertBorder(pos + 2 * x + 1) << "   ";
+            cout << vertBorder(pos + 2 * mapWidth + 1) << endl;
+
+            pos += 2;
+            for(int x = 0; x < mapWidth; x++, pos += 2)cout << '*' << horzBorder(pos);
+            cout << '*' << endl;
+        }
+    }
+
+    bool updateBorders(const model::World &world)
+    {
         enum TileFlags
         {
             f_l = 1, f_u = 2, f_r = 4, f_d = 8,
@@ -480,51 +524,38 @@ struct TileMap
             f_d,        // TOP_HEADED_T
             f_u,        // BOTTOM_HEADED_T
             0,          // CROSSROADS
-            0,          // UNKNOWN
         };
 
+        int unknownOld = unknownCount;
         const vector<vector<model::TileType>> &map = world.getTilesXY();
         for(int x = 0; x < mapWidth; x++)for(int y = 0; y < mapHeight; y++)
         {
-            int flags = tile[map[x][y]], cell = y * mapLine + x;
-            for(int i = 0; i < 4; i++)if(flags & (1 << i))borders[2 * cell + borderOffs[i]] = true;
+            model::TileType type = map[x][y];  if(type == model::UNKNOWN)continue;
+
+            int flags = tile[type], cell = y * mapLine + x;
+            for(int i = 0; i < 4; i++)
+            {
+                int pos = 2 * cell + borderOffs[i];
+                if(flags & (1 << i))borders[pos] = true;
+                if(!visited[pos])
+                {
+                    visited[pos] = true;  unknownCount--;
+                }
+            }
         }
 
         /*
         for(int x = 0; x < mapWidth; x++)for(int y = 0; y < mapHeight; y++)
         {
+            model::TileType type = map[x][y];  if(type == model::UNKNOWN)continue;
+
             int flags = 0, cell = y * mapLine + x;
             for(int i = 0; i < 4; i++)if(borders[2 * cell + borderOffs[i]])flags |= 1 << i;
-            assert(flags == tile[map[x][y]]);
+            assert(flags == tile[type]);
         }
         */
 
-        const vector<vector<int>> &wpts = world.getWaypoints();
-        waypoints.reserve((waypointCount = wpts.size()) * lapCount + 1);
-        for(int i = 0; i < lapCount; i++)for(auto &pt : wpts)
-            waypoints.emplace_back(pt[1] * mapLine + pt[0], &pt == &wpts[0]);
-        waypoints.push_back(waypoints[0]);
-
-        distMap.resize(12 * mapSize * wpts.size() * lapCount, -1);
-        bonuses.resize(mapSize);  slicks.resize(mapSize);
-    }
-
-    int reset(const model::World &world, const model::Car &self)
-    {
-        for(auto &list : bonuses)list.clear();
-        double shift = (carRadius + bonusHalfSize) * invTileSize;  int index = 0;
-        for(auto &bonus : world.getBonuses())addToCells(Bonus(index++, bonus), bonuses, shift);
-
-        for(auto &list : slicks)list.clear();
-        shift = (carRadius + slickRadius + pickupDepth) * invTileSize;
-        for(auto &slick : world.getOilSlicks())addToCells(Slick(slick), slicks, shift);
-
-        washers.clear();
-        for(auto &proj : world.getProjectiles())
-            if(proj.getType() == model::WASHER && proj.getCarId() != self.getId())
-                washers.emplace_back(index++, proj);
-
-        return index;
+        return unknownCount != unknownOld;
     }
 
     struct Segment
@@ -576,7 +607,7 @@ struct TileMap
         };
         constexpr unsigned segDistStart[3] = {91, 128, 91};
 
-        vector<Segment> queue;
+        for(auto &dist : distMap)dist = -1;  vector<Segment> queue;
         int waypoint = waypoints.size() - 2, cell = waypoints.rbegin()->cell;
         for(int i = 0; i < 4; i++)if(!borders[2 * cell + borderOffs[i]])
             generateSegments(queue, waypoint, cell + mapOffs[i], i, 0, segDistStart);
@@ -594,6 +625,10 @@ struct TileMap
             if(prev == waypoints[seg.waypoint].cell && seg.waypoint)
                 generateSegments(queue, seg.waypoint - 1, seg.cell, seg.type + 2, seg.dist, segDistRev[seg.type >> 2]);
         }
+
+#ifdef PRINT_LOG
+        print();
+#endif
     }
 
     unsigned calcDist(int waypoint, int cell, const Vec2D &offs, const Vec2D &dir, const Vec2D &spd)
@@ -602,6 +637,26 @@ struct TileMap
         int base = 12 * (waypoint * mapSize + cell);  unsigned dist = -1;
         for(int i = 0; i < 12; i++)dist = min(dist, distMap[base + i] - segDistStart[i >> 2]);  // TODO: precision
         return dist;
+    }
+
+    int reset(const model::World &world, const model::Car &self)
+    {
+        if(unknownCount && updateBorders(world))calcDistMap();
+
+        for(auto &list : bonuses)list.clear();
+        double shift = (carRadius + bonusHalfSize) * invTileSize;  int index = 0;
+        for(auto &bonus : world.getBonuses())addToCells(Bonus(index++, bonus), bonuses, shift);
+
+        for(auto &list : slicks)list.clear();
+        shift = (carRadius + slickRadius + pickupDepth) * invTileSize;
+        for(auto &slick : world.getOilSlicks())addToCells(Slick(slick), slicks, shift);
+
+        washers.clear();
+        for(auto &proj : world.getProjectiles())
+            if(proj.getType() == model::WASHER && proj.getCarId() != self.getId())
+                washers.emplace_back(index++, proj);
+
+        return index;
     }
 
 
@@ -1886,7 +1941,6 @@ struct Plan
 
     void print() const
     {
-        cout << "Path ";
         if(fireTime < infTime)cout << fireTime;
         else cout << '-';  cout << ' ';
         if(oilTime < infTime)cout << oilTime;
@@ -1910,14 +1964,14 @@ struct Plan
 
 struct Optimizer
 {
-    Plan old;
+    Plan result[2];
+    int lastGood[2];
     unordered_map<int, Plan> best;
     shared_ptr<Position> last;
     int startLeafDist;
     vector<Plan> buf;
-    int lastGood;
 
-    Optimizer() : lastGood(numeric_limits<int>::min())
+    Optimizer() : lastGood{numeric_limits<int>::min(), numeric_limits<int>::min()}
     {
     }
 
@@ -1996,6 +2050,7 @@ struct Optimizer
 
     void process(const model::Car &car)
     {
+        Plan &old = result[car.getType()];
         const CarInfo &info = carInfo[car.getType()];
 
         best.clear();  startLeafDist = -optTileDist;
@@ -2040,14 +2095,29 @@ struct Optimizer
                     last->state, cur, last->time, last->time + programDuration[type]);
             }
         }
-        for(int i = 0; i < mutateStages; i++)
+        for(int i = 0;; i++)
         {
             double score = tileScore;  Plan *sel = nullptr;
             for(auto &track : best)if(score < track.second.score)
             {
                 score = track.second.score;  sel = &track.second;
             }
-            if(!sel)break;
+
+            if(!sel)
+            {
+#ifdef PRINT_LOG
+                cout << (info.jeep ? "JEEP " : "BUGGY ") << "NOT FOUND!!!" << endl;
+#endif
+                if(old.events.size() < 3 || globalTick > lastGood[car.getType()] + 10)old = Plan();
+                break;
+            }
+            else if(i >= mutateStages)
+            {
+#ifdef PRINT_LOG
+                cout << (info.jeep ? "JEEP " : "BUGGY ");  sel->print();
+#endif
+                swap(*sel, old);  lastGood[car.getType()] = globalTick;  break;
+            }
 
             mutate(info, *sel, 0.75, car.getWheelTurn());
             mutate(info, *sel, 0.50, car.getWheelTurn());
@@ -2094,29 +2164,9 @@ struct Optimizer
 
     void execute(const model::Car &car, model::Move &move)
     {
-        double score = tileScore;  Plan *sel = nullptr;
-        for(auto &track : best)if(score < track.second.score)
-        {
-            score = track.second.score;  sel = &track.second;
-        }
-        if(sel)
-        {
-#ifdef PRINT_LOG
-            sel->print();
-#endif
-            sel->execute(move);  swap(*sel, old);  lastGood = globalTick;
-        }
-        else
-        {
-#ifdef PRINT_LOG
-            cout << "Path: NOT FOUND!!!" << endl;
-#endif
-            if(old.events.size() < 3 || globalTick > lastGood + 10)
-            {
-                executeFallback(car, move);  old = Plan();
-            }
-            else old.execute(move);
-        }
+        Plan &plan = result[car.getType()];
+        if(plan.score < 0)executeFallback(car, move);
+        else plan.execute(move);
     }
 };
 
@@ -2130,8 +2180,7 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
     {
         if(globalTick < 0)
         {
-            initConsts(game, world);  srand(game.getRandomSeed());
-            tileMap.init(world);  tileMap.calcDistMap();
+            initConsts(game, world);  srand(game.getRandomSeed());  tileMap.init(world);
         }
         globalTick = world.getTick();
 

@@ -187,9 +187,10 @@ struct BodyInfo
 struct CarInfo : public BodyInfo
 {
     double carAccel, carReverse;
-    long long carId;  bool jeep;
+    long long carId;  int type;
+    const char *name;
 
-    void set(model::CarType type, double mass, double power, double rear);
+    void set(model::CarType type_, double mass, double power, double rear);
 };
 
 
@@ -234,7 +235,8 @@ int breakDuration;
 int nitroDuration, nitroCooldown;
 double nitroPower;
 
-double carHalfWidth, carHalfHeight, carRadius;  CarInfo carInfo[2];
+constexpr int typeCount = 2;
+double carHalfWidth, carHalfHeight, carRadius;  CarInfo carInfo[typeCount];
 double frictMul, longFrict, crossFrict, rotFrictMul, angFrict, carRotFactor;
 double powerChange, invPowerChange, turnChange, invTurnChange;
 
@@ -250,12 +252,17 @@ double tireSpeed, tireEndSpeed2, tireDamage;
 
 int globalTick = -1;
 
-void CarInfo::set(model::CarType type, double mass, double power, double rear)
+void CarInfo::set(model::CarType type_, double mass, double power, double rear)
 {
     BodyInfo::set(mass, carHalfWidth, carHalfHeight);
     carAccel   = power * invMass * physDt;
     carReverse = rear  * invMass * physDt;
-    jeep = (type == model::JEEP);
+    switch(type = type_)
+    {
+    case model::BUGGY:  name = "BUGGY";  break;
+    case model::JEEP:   name = "JEEP";   break;
+    default:  assert(false);
+    }
 }
 
 void initConsts(const model::Game &game, const model::World &world)
@@ -1092,7 +1099,7 @@ struct EnemyPosition
 
     EnemyPosition() = default;
 
-    EnemyPosition &operator = (const EnemyState &state)
+    EnemyPosition &operator = (const CarState &state)
     {
         pos = state.pos;  dir = state.dir;  spd = state.spd;  return *this;
     }
@@ -1181,13 +1188,35 @@ void calcEnemyTracks(const std::vector<model::Car> &cars, int &base)
 {
     int enemyCount = 0;
     for(auto &car : cars)if(!car.isTeammate() && !car.isFinishedTrack())enemyCount++;
-    if(enemyCount < 2)enemyTracks.reserve(2);
+    if(enemyCount < typeCount)enemyTracks.reserve(typeCount);
     enemyTracks.resize(enemyCount);
 
     int index = 0;
     for(auto &car : cars)if(!car.isTeammate() && !car.isFinishedTrack())
         enemyTracks[index++].calc(car, base);
 }
+
+
+struct AllyPosition
+{
+    Vec2D pos, dir;
+
+    AllyPosition(const CarState &state) : pos(state.pos), dir(state.dir)
+    {
+    }
+
+    operator Quad() const
+    {
+        return Quad(pos, dir, carHalfWidth, carHalfHeight);
+    }
+
+    bool checkCircle(const Vec2D &pt, double rad) const
+    {
+        return Quad(*this).pointDist2(pt) < sqr(rad - pickupDepth);
+    }
+};
+
+vector<AllyPosition> allyTrack[typeCount];
 
 
 struct AllyState : public CarState
@@ -1299,10 +1328,10 @@ struct AllyState : public CarState
         }
     }
 
-    void useBonuses(bool jeep, int time)
+    void useBonuses(int type, int time)
     {
         if(time >= enemyLookahead)return;
-        if(ammoCount && time >= fireReady)jeep ? tryFireTire(time) : tryFireWasher(time);
+        if(ammoCount && time >= fireReady)type == model::JEEP ? tryFireTire(time) : tryFireWasher(time);
         if(oilCount && time >= oilReady)tryOil(time);
     }
 
@@ -1333,9 +1362,7 @@ struct AllyState : public CarState
         waypoint = carData[car.getId()].waypoint;
         Vec2D offs = StepState::calcCell(pos, cell);
         base = tileMap.calcDist(waypoint - 1, cell, offs, dir, spd);
-
         fireTime = oilTime = infTime;  fireScore = oilScore = 0;
-        useBonuses(car.getType() == model::JEEP, 0);
     }
 
     bool collide(const CarInfo &info, Quad &car, int time, StepState &state)
@@ -1398,6 +1425,13 @@ struct AllyState : public CarState
             if((durability -= damage) < 0)return false;  hitFlags |= tire.flag;
         }
 
+        const auto &track = allyTrack[info.type ^ 1];
+        if(size_t(time) < track.size())
+        {
+            Vec2D norm, pt;
+            if(car.collide(track[time], norm, pt) > -pickupDepth)return false;
+        }
+
         if(time < impactLookahead)for(const auto &track : enemyTracks)
         {
             Vec2D norm(0, 0), pt;
@@ -1437,7 +1471,7 @@ struct AllyState : public CarState
         score -= distPenalty * pow<distPower>(1 - max(0.0, state.borderDist) / maxDist);
         score -= damagePenalty * pow<repairPower>(1 - durability);
         if(powerTarget < 1)score -= reversePenalty;
-        useBonuses(info.jeep, time + 1);
+        useBonuses(info.type, time + 1);
 
         if(state.cell == cell || abs(state.offs.x) > tileToggle || abs(state.offs.y) > tileToggle)return true;
         if(state.cell == tileMap.waypoints[waypoint].cell && tileMap.waypoints[waypoint++].finish)
@@ -1580,7 +1614,8 @@ struct ProgramState : public Move
     int prevPower, prevTurn, turnEvent, turnEnd;
     bool prevBrake;
 
-    ProgramState(const CarInfo &info, const AllyState &state, vector<Event> &&base, int time) : events(base), turnEvent(-1)
+    ProgramState(const CarInfo &info, const AllyState &state,
+        vector<Event> &&base, int time) : events(move(base)), turnEvent(-1)
     {
         int pos = 0;
         for(; events[pos].time < time; pos++)
@@ -1770,7 +1805,7 @@ namespace Program
         vector<Command> data;
         map<string, int> labels;
 
-        Bytecode(Listing &&program) : data(program.data), labels(program.labels)
+        Bytecode(Listing &&program) : data(move(program.data)), labels(move(program.labels))
         {
             for(auto &label : labels)
             {
@@ -1901,7 +1936,7 @@ struct Position
     int eventCount;
 
     Position(shared_ptr<Position> &&prev_, int time_, const AllyState &state_, int eventCount_) :
-        time(time_), leafDist(0), prev(prev_), state(state_), eventCount(eventCount_)
+        time(time_), leafDist(0), prev(move(prev_)), state(state_), eventCount(eventCount_)
     {
     }
 };
@@ -1964,8 +1999,8 @@ struct Plan
 
 struct Optimizer
 {
-    Plan result[2];
-    int lastGood[2];
+    Plan result[typeCount];
+    int lastGood[typeCount];
     unordered_map<int, Plan> best;
     shared_ptr<Position> last;
     int startLeafDist;
@@ -2048,13 +2083,26 @@ struct Optimizer
         executePlan(*this, info, (*ptr)->state, events, (*ptr)->time, plan.time + offset);
     }
 
-    void process(const model::Car &car)
+    static void generateTrack(const CarInfo &info, AllyState state, const Plan &plan)
     {
-        Plan &old = result[car.getType()];
-        const CarInfo &info = carInfo[car.getType()];
+        allyTrack[info.type].clear();
+        allyTrack[info.type].emplace_back(state);  Move cur;
+        int endTime = max(plan.time, impactLookahead), time = 0, pos = 0;
+        while(time < endTime)
+        {
+            for(; plan.events[pos].time <= time; pos++)cur.update(plan.events[pos].type);
+            if(!cur.nextStep(info, state, time++))break;
+            allyTrack[info.type].emplace_back(state);
+        }
+    }
 
-        best.clear();  startLeafDist = -optTileDist;
-        assert(!last);  last = make_shared<Position>(move(last), 0, car, 0);
+    void process(const CarInfo &info, const AllyState &state)
+    {
+        Plan &old = result[info.type];  best.clear();
+        startLeafDist = -optTileDist;  assert(!last);
+        last = make_shared<Position>(move(last), 0, state, 0);
+        last->state.useBonuses(info.type, 0);
+
         executePlan(*this, info, last->state, old.events, 0, old.time);
 
         startLeafDist = 0;
@@ -2106,25 +2154,25 @@ struct Optimizer
             if(!sel)
             {
 #ifdef PRINT_LOG
-                cout << (info.jeep ? "JEEP " : "BUGGY ") << "NOT FOUND!!!" << endl;
+                cout << info.name << ": NOT FOUND!!!" << endl;
 #endif
-                if(old.events.size() < 3 || globalTick > lastGood[car.getType()] + 10)old = Plan();
+                if(old.events.size() < 3 || globalTick > lastGood[info.type] + 10)old = Plan();
                 break;
             }
             else if(i >= mutateStages)
             {
 #ifdef PRINT_LOG
-                cout << (info.jeep ? "JEEP " : "BUGGY ");  sel->print();
+                cout << info.name << ' ';  sel->print();
 #endif
-                swap(*sel, old);  lastGood[car.getType()] = globalTick;  break;
+                swap(*sel, old);  lastGood[info.type] = globalTick;  break;
             }
 
-            mutate(info, *sel, 0.75, car.getWheelTurn());
-            mutate(info, *sel, 0.50, car.getWheelTurn());
-            mutate(info, *sel, 0.25, car.getWheelTurn());
-            mutate(info, *sel, 0.00, car.getWheelTurn());
+            mutate(info, *sel, 0.75, state.turn);
+            mutate(info, *sel, 0.50, state.turn);
+            mutate(info, *sel, 0.25, state.turn);
+            mutate(info, *sel, 0.00, state.turn);
         }
-        last.reset();
+        last.reset();  generateTrack(info, state, old);
     }
 
     void executeFallback(const model::Car &car, model::Move &move)
@@ -2168,6 +2216,32 @@ struct Optimizer
         if(plan.score < 0)executeFallback(car, move);
         else plan.execute(move);
     }
+
+    void process(const std::vector<model::Car> &cars)
+    {
+        AllyState start[typeCount];  int flags = 0;
+        for(auto &car : cars)if(car.isTeammate() && !car.isFinishedTrack())
+        {
+            start[car.getType()] = AllyState(car);  flags |= 1 << car.getType();
+        }
+        for(int i = 0; i < typeCount; i++)
+        {
+            if(flags & (1 << i))generateTrack(carInfo[i], start[i], result[i]);
+            else allyTrack[i].clear();
+        }
+
+        int last;
+        switch(flags)
+        {
+        case 0:  return;
+        case 1 << model::BUGGY:  last = model::BUGGY;  break;
+        case 1 << model::JEEP:   last = model::JEEP;   break;
+        default:  last = start[0].base > start[1].base ? 0 : 1;
+        }
+
+        process(carInfo[last], start[last]);
+        if(flags != 1 << last)process(carInfo[last ^ 1], start[last ^ 1]);
+    }
 };
 
 Optimizer optimizer;
@@ -2176,6 +2250,11 @@ Optimizer optimizer;
 
 void MyStrategy::move(const model::Car &self, const model::World &world, const model::Game &game, model::Move &move)
 {
+    if(world.getTick() < game.getInitialFreezeDurationTicks())
+    {
+        move.setEnginePower(1);  return;
+    }
+
     if(globalTick != world.getTick())
     {
         if(globalTick < 0)
@@ -2189,16 +2268,10 @@ void MyStrategy::move(const model::Car &self, const model::World &world, const m
         int index = tileMap.reset(world, self);
         calcTireTracks(world.getProjectiles(), index);
         calcEnemyTracks(world.getCars(), index);
+        optimizer.process(world.getCars());
     }
 
-    if(globalTick < game.getInitialFreezeDurationTicks())
-    {
-        move.setEnginePower(1);  return;
-    }
-    else if(self.isFinishedTrack() || self.getDurability() <= 0)return;
-
-    optimizer.process(self);
-    optimizer.execute(self, move);
+    if(!self.isFinishedTrack() && self.getDurability() > 0)optimizer.execute(self, move);
 
     /*
     static int fireTime = infTime;

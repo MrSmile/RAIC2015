@@ -235,7 +235,7 @@ int breakDuration;
 int nitroDuration, nitroCooldown;
 double nitroPower;
 
-constexpr int typeCount = 2;
+constexpr int typeCount = 2, maxEnemyCount = 3;
 double carHalfWidth, carHalfHeight, carRadius;  CarInfo carInfo[typeCount];
 double frictMul, longFrict, crossFrict, rotFrictMul, angFrict, carRotFactor;
 double powerChange, invPowerChange, turnChange, invTurnChange;
@@ -249,6 +249,8 @@ double washerSpeed, washerDamage;
 
 double tireRadius, tireRadius2;  BodyInfo tireInfo;
 double tireSpeed, tireEndSpeed2, tireDamage;
+
+double fireCellBorder;
 
 int globalTick = -1;
 
@@ -320,6 +322,10 @@ void initConsts(const model::Game &game, const model::World &world)
     tireSpeed = game.getTireInitialSpeed();
     tireEndSpeed2 = sqr(tireSpeed * game.getTireDisappearSpeedFactor());
     tireDamage = game.getTireDamageFactor() / tireSpeed;
+
+    double fireRadius = max(max(carRadius, slickRadius),
+        washerSideRot.y * washerSpeed * enemyLookahead + washerRadius);
+    fireCellBorder = (fireRadius + carRadius + pickupDepth) * invTileSize;
 }
 
 
@@ -420,7 +426,35 @@ struct Washer
     }
 };
 
-template<typename T> void addToCells(T &&item, vector<vector<T>> &map, double border)
+struct CarTimeRange
+{
+    struct State
+    {
+        Vec2D pos;  int time;
+
+        State(const Vec2D &pos_, int time_) : pos(pos_), time(time_)
+        {
+        }
+    };
+
+    int startTime, endTime;
+
+    CarTimeRange() : startTime(infTime), endTime(0)
+    {
+    }
+
+    void clear()
+    {
+        *this = CarTimeRange();
+    }
+
+    void push_back(const State &state)
+    {
+        startTime = min(startTime, state.time);  endTime = max(endTime, state.time + 1);
+    }
+};
+
+template<typename T, typename TT> void addToCells(T &&item, vector<TT> &map, double border)
 {
     Vec2D offs = item.pos * invTileSize;
     int x = min(int(offs.x), mapWidth  - 1);
@@ -454,6 +488,8 @@ struct TileMap
     vector<Waypoint> waypoints;
 
     vector<unsigned> distMap;
+    vector<CarTimeRange> enemyCars[maxEnemyCount];
+    vector<CarTimeRange> allyCars[typeCount];
     vector<vector<Bonus>> bonuses;
     vector<vector<Slick>> slicks;
     vector<Washer> washers;
@@ -479,6 +515,8 @@ struct TileMap
         waypoints.push_back(waypoints[0]);
 
         distMap.resize(12 * mapSize * wpts.size() * lapCount);
+        for(auto &cars : enemyCars)cars.resize(mapSize);
+        for(auto &cars :  allyCars)cars.resize(mapSize);
         bonuses.resize(mapSize);  slicks.resize(mapSize);
     }
 
@@ -1121,64 +1159,30 @@ struct EnemyPosition
 };
 
 
-struct Box
-{
-    double xMin, xMax, yMin, yMax;
-
-    Box() = default;
-
-    Box(const Vec2D &pt) : xMin(pt.x), xMax(pt.x), yMin(pt.y), yMax(pt.y)
-    {
-    }
-
-    Box(double xMin_, double xMax_, double yMin_, double yMax_) :
-        xMin(xMin_), xMax(xMax_), yMin(yMin_), yMax(yMax_)
-    {
-    }
-
-    void add(const Vec2D &pt)
-    {
-        xMin = min(xMin, pt.x);  xMax = max(xMax, pt.x);
-        yMin = min(yMin, pt.y);  yMax = max(yMax, pt.y);
-    }
-
-    Box offset(double border) const
-    {
-        return Box(xMin - border, xMax + border, yMin - border, yMax + border);
-    }
-
-    bool cross(const Box &box) const
-    {
-        return xMin < box.xMax && xMax > box.xMin && yMin < box.yMax && yMax > box.yMin;
-    }
-
-    operator Quad() const
-    {
-        return Quad(Vec2D((xMin + xMax) / 2, (yMin + yMax) / 2), Vec2D(1, 0), (xMax - xMin) / 2, (yMax - yMin) / 2);
-    }
-};
-
 struct EnemyTrack
 {
     EnemyPosition pos[enemyLookahead + 1][enemyTrackCount];
-    Box bound;  double durability, speed;  int oilReady;
+    int oilReady;  double durability;
     unsigned flag[enemyTrackCount];
 
-    void calc(const model::Car &car, int &index)
+    void calc(const model::Car &car, vector<CarTimeRange> &ranges, int &index)
     {
+        for(auto &range : ranges)range.clear();
+
         const CarInfo &info = carInfo[car.getType()];
         EnemyState state[enemyTrackCount] = {car, car, car};
-        bound = Box(state[0].pos);  speed = state[0].spd.len();
+        addToCells(CarTimeRange::State(state[0].pos, 0), ranges, fireCellBorder);
         for(int time = 0; time < enemyLookahead; time++)for(int i = 0; i < enemyTrackCount; i++)
         {
-            pos[time][i] = state[i];  state[i].nextStep(info, time, 1, i - 1, false);  bound.add(state[i].pos);
+            pos[time][i] = state[i];  state[i].nextStep(info, time, 1, i - 1, false);
+            addToCells(CarTimeRange::State(state[i].pos, time + 1), ranges, fireCellBorder);
         }
         for(int i = 0; i < enemyTrackCount; i++)
         {
             pos[enemyLookahead][i] = state[i];  flag[i] = 1 << (index++ & 31);
         }
-        bound = bound.offset(carRadius);  durability = car.getDurability();
         oilReady = car.getOilCanisterCount() ? car.getRemainingOilCooldownTicks() : infTime;
+        durability = car.getDurability();
     }
 };
 
@@ -1193,7 +1197,9 @@ void calcEnemyTracks(const std::vector<model::Car> &cars, int &base)
 
     int index = 0;
     for(auto &car : cars)if(!car.isTeammate() && !car.isFinishedTrack())
-        enemyTracks[index++].calc(car, base);
+    {
+        enemyTracks[index].calc(car, tileMap.enemyCars[index], base);  index++;
+    }
 }
 
 
@@ -1212,7 +1218,7 @@ struct AllyPosition
 
     bool checkCircle(const Vec2D &pt, double rad) const
     {
-        return Quad(*this).pointDist2(pt) < sqr(rad - pickupDepth);
+        return Quad(*this).pointDist2(pt) < sqr(rad + pickupDepth);
     }
 };
 
@@ -1231,107 +1237,178 @@ struct AllyState : public CarState
 
     AllyState() = default;
 
-    void tryFireWasher(int time)
+    void tryFireWasher(int type, int start)
     {
-        Vec2D speed[3];
+        constexpr int washerCount = 3;
+
+        int hit[maxEnemyCount];
+        for(size_t i = 0; i < enemyTracks.size(); i++)hit[i] = 0;
+
+        Vec2D speed[washerCount];
         speed[0] = washerSpeed * dir;
         speed[1] = rotate(speed[0], washerSideRot);
         speed[2] = rotate(speed[0], conj(washerSideRot));
 
-        double hw = washerSpeed * (enemyLookahead - time) / 2, best = 0;
-        Quad bound(pos + hw * dir, dir, hw, 2 * hw * washerSideRot.y);
-        for(const auto &track : enemyTracks)if(track.durability > 0)
+        Vec2D washer[washerCount] = {pos, pos, pos};
+        for(int time = start; time <= enemyLookahead;)
         {
-            Vec2D norm, pt;
-            if(bound.collide(track.bound.offset(washerRadius), norm, pt) < 0)continue;
+            for(int k = 0; k < washerCount; k++)washer[k] += speed[k];  time++;
 
-            Vec2D washer[3] = {pos, pos, pos};  int hit = 0;
-            for(int t = time + 1; t <= enemyLookahead; t++)
+            Vec2D offs = washer[0] * invTileSize;
+            if(offs.x < 0 || offs.x >= mapWidth || offs.y < 0 || offs.y >= mapHeight)break;
+
+            int cell = int(offs.y) * mapLine + int(offs.x);
+            for(int i = 0; i < typeCount; i++)if(allyTrack[i].size() && i != type)
             {
-                for(int j = 0; j < 3; j++)washer[j] += speed[j];
-                for(int i = 0, flag = 1; i < enemyTrackCount; i++)for(int j = 0; j < 3; j++, flag <<= 1)
-                    if(track.pos[t][i].checkCircle(washer[j], washerRadius))hit |= flag;
-            }
+                const auto &range = tileMap.allyCars[i][cell];
+                if(time < range.startTime || time >= range.endTime)continue;
 
+                const auto &car = allyTrack[i][time];
+                for(int k = 0; k < washerCount; k++)
+                    if(car.checkCircle(washer[k], washerRadius))return;
+            }
+            for(size_t i = 0; i < enemyTracks.size(); i++)
+            {
+                const auto &range = tileMap.enemyCars[i][cell];
+                if(time < range.startTime || time >= range.endTime)continue;
+
+                const auto &track = enemyTracks[i];
+                for(int j = 0, flag = 1; j < enemyTrackCount; j++)
+                {
+                    const auto &car = track.pos[time][j];
+                    for(int k = 0; k < washerCount; k++, flag <<= 1)
+                    {
+                        if(car.checkCircle(washer[k], washerRadius))hit[i] |= flag;
+                    }
+                }
+            }
+        }
+
+        const int hitMask = (1 << washerCount) - 1;  double best = 0;
+        for(size_t i = 0; i < enemyTracks.size(); i++)if(hit[i])
+        {
+            const auto &track = enemyTracks[i];  if(track.durability <= 0)continue;
+
+            int hitCount = washerCount;
             constexpr int bitsum[] = {0, 1, 1, 2, 1, 2, 2, 3};
-            int hitCount = min(min(bitsum[hit & 7], bitsum[(hit >> 3) & 7]), bitsum[(hit >> 6) & 7]);
+            for(int j = 0; j < enemyTrackCount; j++, hit[i] >>= washerCount)
+                hitCount = min(hitCount, bitsum[hit[i] & hitMask]);
+
             double durability = track.durability - hitCount * washerDamage;
             double delta = pow<firePower>(1 - max(0.0, durability)) - pow<firePower>(1 - track.durability);
             if(durability < 0)delta += 1;  best = max(best, damageScore * delta);
         }
         if(fireScore < (best -= ammoCost))
         {
-            fireTime = time;  fireScore = best;
+            fireTime = start;  fireScore = best;
         }
     }
 
-    void tryFireTire(int time)
+    void tryFireTire(int type, int start)
     {
-        TireState tire[enemyLookahead + 1];
-        int endTime = time;  Box bound(pos);
-        for(TireState cur(pos, dir); endTime <= enemyLookahead; endTime++)
+        const int allHit = (1 << enemyTrackCount) - 1;
+        int hit[maxEnemyCount];  double minDamage[maxEnemyCount];
+        for(size_t i = 0; i < enemyTracks.size(); i++)
         {
-            tire[endTime] = cur;
-            if(cur.nextStep() && cur.spd.sqr() < tireEndSpeed2)break;
-            bound.add(cur.pos);
+            hit[i] = enemyTracks[i].durability > 0 ? 0 : allHit;  minDamage[i] = 1;
         }
-        bound.offset(tireRadius);
+
+        TireState tire(pos, dir);  bool firstHit = false;
+        for(int time = start; time <= enemyLookahead;)
+        {
+            if(tire.nextStep())
+            {
+                if(tire.spd.sqr() < tireEndSpeed2)break;  firstHit = true;
+            }
+            time++;
+
+            Vec2D offs = tire.pos * invTileSize;
+            int cell = int(offs.y) * mapLine + int(offs.x);
+            for(int i = 0; i < typeCount; i++)if(allyTrack[i].size() && (firstHit || i != type))
+            {
+                const auto &range = tileMap.allyCars[i][cell];
+                if(time < range.startTime || time >= range.endTime)continue;
+                if(allyTrack[i][time].checkCircle(tire.pos, tireRadius))return;
+            }
+            for(size_t i = 0; i < enemyTracks.size(); i++)
+            {
+                const auto &range = tileMap.enemyCars[i][cell];
+                if(time < range.startTime || time >= range.endTime)continue;
+
+                const auto &track = enemyTracks[i];
+                for(int j = 0; j < enemyTrackCount; j++)if(!(hit[i] & (1 << j)))
+                    if(track.pos[time][j].checkCircle(tire.pos, tireRadius))
+                    {
+                        const auto &car = track.pos[time][j];  Vec2D d = Quad(car).collide(tire.pos);
+                        double damage = tireDamage * max(0.0, (car.spd - tire.spd) * normalize(d));
+                        minDamage[i] = min(minDamage[i], damage);  hit[i] |= 1 << j;
+                    }
+            }
+        }
 
         double best = 0;
-        for(const auto &track : enemyTracks)if(track.durability > 0)
+        for(size_t i = 0; i < enemyTracks.size(); i++)if(hit[i] == allHit)
         {
-            if(!bound.cross(track.bound))continue;
+            const auto &track = enemyTracks[i];  if(track.durability <= 0)continue;
 
-            int hit[enemyTrackCount] = {infTime, infTime, infTime};
-            for(int t = time + 1; t < endTime; t++)for(int i = 0; i < enemyTrackCount; i++)
-                if(track.pos[t][i].checkCircle(tire[t].pos, tireRadius))hit[i] = min(hit[i], t);
-
-            double minDamage = numeric_limits<double>::infinity();
-            for(int i = 0; i < enemyTrackCount; i++)
-            {
-                double damage = 0;
-                if(hit[i] < infTime && (track.pos[time][i].pos - pos) * dir > 0)
-                {
-                    Vec2D d = Quad(track.pos[hit[i]][i]).collide(tire[hit[i]].pos);
-                    damage = tireDamage * max(0.0, (track.pos[hit[i]][i].spd - tire[hit[i]].spd) * normalize(d));
-                }
-                minDamage = min(minDamage, damage);
-            }
-
-            double durability = track.durability - minDamage;
+            double durability = track.durability - minDamage[i];
             double delta = pow<firePower>(1 - max(0.0, durability)) - pow<firePower>(1 - track.durability);
             if(durability < 0)delta += 1;  best = max(best, damageScore * delta);
         }
         if(fireScore < (best -= ammoCost))
         {
-            fireTime = time;  fireScore = best;
+            fireTime = start;  fireScore = best;
         }
     }
 
-    void tryOil(int time)
+    void tryOil(int start)
     {
-        Vec2D slick = pos - slickOffset * dir;  double best = -oilCost;
-        for(const auto &track : enemyTracks)
+        Vec2D slick = pos - slickOffset * dir, offs = slick * invTileSize;
+        if(offs.x < 0 || offs.x >= mapWidth || offs.y < 0 || offs.y >= mapHeight)return;
+
+        int cell = int(offs.y) * mapLine + int(offs.x);
+        for(int i = 0; i < typeCount; i++)
         {
-            if(!track.bound.offset(slickRadius - carRadius).cross(slick))continue;
+            const auto &track = allyTrack[i];
+            const auto &range = tileMap.allyCars[i][cell];
+
+            int beg = max(start + 1, range.startTime);
+            int end = min(enemyLookahead + 1, range.endTime);
+            for(int time = beg; time < end; time++)
+                if((track[time].pos - slick).sqr() < sqr(slickRadius + pickupDepth))return;
+        }
+
+        double best = -oilCost;
+        int allHit = (1 << enemyTrackCount) - 1;
+        for(size_t i = 0; i < enemyTracks.size(); i++)
+        {
+            const auto &track = enemyTracks[i];  if(track.durability <= 0)continue;
+            const auto &range = tileMap.enemyCars[i][cell];
 
             int hit = 0;
-            for(int t = time + 1; t <= enemyLookahead; t++)
-                for(int i = 0, flag = 1; i < enemyTrackCount; i++, flag <<= 1)
-                    if((track.pos[t][i].pos - slick).sqr() < sqr(slickRadius - pickupDepth))hit |= flag;
+            int beg = max(start + 1, range.startTime);
+            int end = min(enemyLookahead + 1, range.endTime);
+            double minSpeed = numeric_limits<double>::infinity();
+            for(int time = beg; time < end; time++)
+                for(int j = 0, flag = 1; j < enemyTrackCount; j++, flag <<= 1)if(!(hit & flag))
+                    if((track.pos[time][j].pos - slick).sqr() < sqr(slickRadius - pickupDepth))
+                    {
+                        minSpeed = min(minSpeed, track.pos[time][j].spd.len());  hit |= flag;
+                    }
 
-            if(hit == 7)best += slickScore * track.speed;
+            if(hit == allHit)best += slickScore * minSpeed;
         }
         if(oilScore < best)
         {
-            oilTime = time;  oilScore = best;
+            oilTime = start;  oilScore = best;
         }
     }
 
     void useBonuses(int type, int time)
     {
         if(time >= enemyLookahead)return;
-        if(ammoCount && time >= fireReady)type == model::JEEP ? tryFireTire(time) : tryFireWasher(time);
+        if(ammoCount && time >= fireReady)
+            type == model::JEEP ? tryFireTire(type, time) : tryFireWasher(type, time);
         if(oilCount && time >= oilReady)tryOil(time);
     }
 
@@ -2085,6 +2162,9 @@ struct Optimizer
 
     static void generateTrack(const CarInfo &info, AllyState state, const Plan &plan)
     {
+        auto &ranges = tileMap.allyCars[info.type];
+        for(auto &range : ranges)range.clear();
+
         allyTrack[info.type].clear();
         allyTrack[info.type].emplace_back(state);  Move cur;
         int endTime = max(plan.time, impactLookahead), time = 0, pos = 0;
@@ -2092,6 +2172,8 @@ struct Optimizer
         {
             for(; plan.events[pos].time <= time; pos++)cur.update(plan.events[pos].type);
             if(!cur.nextStep(info, state, time++))break;
+
+            addToCells(CarTimeRange::State(state.pos, time), ranges, fireCellBorder);
             allyTrack[info.type].emplace_back(state);
         }
     }

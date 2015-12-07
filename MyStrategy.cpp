@@ -2171,7 +2171,7 @@ struct Optimizer
         while(time < endTime)
         {
             for(; plan.events[pos].time <= time; pos++)cur.update(plan.events[pos].type);
-            if(!cur.nextStep(info, state, time++))break;
+            if(!cur.nextStep(info, state, time++) || state.dist >= optTileDist)break;
 
             addToCells(CarTimeRange::State(state.pos, time), ranges, fireCellBorder);
             allyTrack[info.type].emplace_back(state);

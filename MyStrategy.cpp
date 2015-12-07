@@ -217,7 +217,8 @@ constexpr double pickupDepth = 10;
 
 constexpr double largeSpeed = 30;
 
-constexpr int optTileDist = 8 * 256, allyLookahead = 600;
+constexpr int tileDist = 256;
+constexpr int optTileDist = 8 * tileDist, allyLookahead = 600;
 constexpr int enemyTrackCount = 3, enemyLookahead = 50;
 constexpr int mutateStep = 16, mutateStages = 16;
 
@@ -642,15 +643,16 @@ struct TileMap
 
     void calcDistMap()
     {
+        constexpr unsigned tile = tileDist, diag = lround(tile / sqrt(2));
         constexpr unsigned segDist[3][3] =
         {
-            {512, 256, 181}, {256, 256, 256}, {181, 256, 512}
+            {2 * tile, tile, diag}, {tile, tile, tile}, {diag, tile, 2 * tile}
         };
         constexpr unsigned segDistRev[3][3] =
         {
-            {256, 768, 1024}, {768, 1024, 768}, {1024, 768, 256}
+            {tile, 3 * tile, 4 * tile}, {3 * tile, 4 * tile, 3 * tile}, {4 * tile, 3 * tile, tile},
         };
-        constexpr unsigned segDistStart[3] = {91, 128, 91};
+        constexpr unsigned segDistStart[3] = {diag, tile, diag};
 
         for(auto &dist : distMap)dist = -1;  vector<Segment> queue;
         int waypoint = waypoints.size() - 2, cell = waypoints.rbegin()->cell;
@@ -678,10 +680,39 @@ struct TileMap
 
     unsigned calcDist(int waypoint, int cell, const Vec2D &offs, const Vec2D &dir, const Vec2D &spd)
     {
-        constexpr unsigned segDistStart[3] = {91, 128, 91};
-        int base = 12 * (waypoint * mapSize + cell);  unsigned dist = -1;
-        for(int i = 0; i < 12; i++)dist = min(dist, distMap[base + i] - segDistStart[i >> 2]);  // TODO: precision
-        return dist;
+        constexpr unsigned tile = tileDist, diag = lround(tile / sqrt(2));
+
+        int base = 12 * (waypoint * mapSize + cell);  unsigned lim = -1;
+        for(int i = 0; i < 12; i++)lim = min(lim, distMap[base + i]);
+        lim += 4 * tile;
+
+        constexpr double dirSpd = 5;
+        Vec2D effDir = dirSpd * dir + spd;
+        effDir /= sqrt(effDir.sqr() + spdEps2);
+
+        int type = 1;
+        Vec2D check = offs;
+        if(signbit(effDir.x))
+        {
+            type ^= 3;  check.y = -check.y;
+        }
+        if(signbit(effDir.y))
+        {
+            type ^= 1;  check.x = -check.x;
+        }
+        int prev = ((type + 3) & 3) | 8;
+        if(check.y > check.x)swap(type, prev);
+        unsigned diagDist = min(min(lim, distMap[base + type]),
+            distMap[base + 12 * mapOffs[type & 3] + prev] - diag);
+
+        if(abs(effDir.x) > abs(effDir.y))
+             type = signbit(effDir.x) ? 6 : 4;
+        else type = signbit(effDir.y) ? 7 : 5;
+        unsigned sideDist = min(min(lim, distMap[base + type]),
+            distMap[base + 12 * mapOffs[type & 3] + type] - tile);
+
+        double mul = sqr(2 * effDir.x * effDir.y);
+        return lround(sideDist + int(diagDist - sideDist) * mul - (offs * effDir) * tile);
     }
 
     int reset(const model::World &world, const model::Car &self)

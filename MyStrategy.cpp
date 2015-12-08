@@ -195,12 +195,14 @@ struct CarInfo : public BodyInfo
 
 
 constexpr double maxDist = 16;
+constexpr double pickupDepth = 10;
 constexpr double timeEps = 0.001;
 constexpr double spdEps2 = 1e-12;
 
 constexpr double tileToggle = 0.49;
 constexpr double tileScore = 1000;
 
+constexpr double maxBlowSpeed = 5;
 constexpr double pickupScore = 5;
 constexpr double ammoCost = 20, nitroCost = 20, oilCost = 20, scoreBonus = 200;
 constexpr int repairPower = 2, firePower = 2;
@@ -212,8 +214,7 @@ constexpr int impactLookahead = 20;
 constexpr int distPower = 4;
 constexpr double distPenalty = 100;
 constexpr double reversePenalty = 3;
-constexpr double maxBlowSpeed = 5;
-constexpr double pickupDepth = 10;
+constexpr double leadBonus = 1;
 
 constexpr double largeSpeed = 30;
 
@@ -1120,7 +1121,7 @@ struct CarState
             angSpd *= rotFrictMul;  angSpd += rot - limit(angSpd, africt);
 
             Quad car(pos, dir, carHalfWidth, carHalfHeight);
-            if(!static_cast<T *>(this)->collide(info, car, time, state))return false;
+            if(!static_cast<T *>(this)->collide(info, car, time + 1, state))return false;
         }
         angSpd -= rot;  return true;
     }
@@ -1133,15 +1134,35 @@ struct CarState
 };
 
 
-struct EnemyState : public CarState
+struct StepState
 {
-    EnemyState(const model::Car &car) : CarState(car)
+    Vec2D offs;  int cell;
+
+    static Vec2D calcCell(const Vec2D &pos, int &cell)
     {
+        Vec2D offs = pos * invTileSize;  int x = int(offs.x), y = int(offs.y);
+        cell = y * mapLine + x;  return offs - Vec2D(x + 0.5, y + 0.5);
     }
 
-    struct StepState
+    void calcCell(const Vec2D &pos)
     {
-    };
+        offs = calcCell(pos, cell);
+    }
+};
+
+struct EnemyState : public CarState
+{
+    int waypoint, cell;
+    unsigned dist;
+
+    EnemyState() = default;
+
+    EnemyState(const model::Car &car) : CarState(car)
+    {
+        waypoint = carData[car.getId()].waypoint;
+        Vec2D offs = StepState::calcCell(pos, cell);
+        dist = tileMap.calcDist(waypoint - 1, cell, offs, dir, spd);
+    }
 
     bool collide(const CarInfo &info, Quad &car, int time, StepState &state)
     {
@@ -1152,13 +1173,22 @@ struct EnemyState : public CarState
             solveCollision(info, *this, borderInfo, pt, norm, pt, carBounce, carFrict);
             pos += depth * norm;
         }
-        return true;
+        state.calcCell(pos);  return true;
     }
 
     bool nextStep(const CarInfo &info, int time, int powerTarget, int turnTarget, bool brake)
     {
         StepState state;
-        return CarState::nextStep<EnemyState>(state, info, time, powerTarget, turnTarget, brake);
+        if(!CarState::nextStep<EnemyState>(state, info, time, powerTarget, turnTarget, brake))return false;
+        if(state.cell == tileMap.waypoints[waypoint].cell && tileMap.waypoints[waypoint++].finish)
+        {
+            if(size_t(waypoint) >= tileMap.waypoints.size())  // finish
+            {
+                dist = 0;  return false;
+            }
+            nitroCount++;  ammoCount++;  oilCount++;
+        }
+        dist = min(dist, tileMap.calcDist(waypoint - 1, cell = state.cell, state.offs, dir, spd));  return true;
     }
 };
 
@@ -1192,6 +1222,7 @@ struct EnemyPosition
 
 struct EnemyTrack
 {
+    unsigned dist[enemyLookahead + 1];
     EnemyPosition pos[enemyLookahead + 1][enemyTrackCount];
     int oilReady;  double durability;
     unsigned flag[enemyTrackCount];
@@ -1201,16 +1232,22 @@ struct EnemyTrack
         for(auto &range : ranges)range.clear();
 
         const CarInfo &info = carInfo[car.getType()];
-        EnemyState state[enemyTrackCount] = {car, car, car};
-        addToCells(CarTimeRange::State(state[0].pos, 0), ranges, fireCellBorder);
-        for(int time = 0; time < enemyLookahead; time++)for(int i = 0; i < enemyTrackCount; i++)
-        {
-            pos[time][i] = state[i];  state[i].nextStep(info, time, 1, i - 1, false);
-            addToCells(CarTimeRange::State(state[i].pos, time + 1), ranges, fireCellBorder);
-        }
+        EnemyState state[enemyTrackCount], start = car;  dist[0] = start.dist;
+        addToCells(CarTimeRange::State(start.pos, 0), ranges, fireCellBorder);
         for(int i = 0; i < enemyTrackCount; i++)
         {
-            pos[enemyLookahead][i] = state[i];  flag[i] = 1 << (index++ & 31);
+            pos[0][i] = state[i] = start;  flag[i] = 1 << (index++ & 31);
+        }
+        for(int time = 1; time <= enemyLookahead; time++)
+        {
+            unsigned minDist = -1;
+            for(int i = 0; i < enemyTrackCount; i++)
+            {
+                state[i].nextStep(info, time - 1, 1, i - 1, false);
+                addToCells(CarTimeRange::State(state[i].pos, time), ranges, fireCellBorder);
+                pos[time][i] = state[i];  minDist = min(minDist, state[i].dist);
+            }
+            dist[time] = minDist;
         }
         oilReady = car.getOilCanisterCount() ? car.getRemainingOilCooldownTicks() : infTime;
         durability = car.getDurability();
@@ -1443,25 +1480,12 @@ struct AllyState : public CarState
         if(oilCount && time >= oilReady)tryOil(time);
     }
 
-    struct StepState
+    struct StepState : public ::StepState
     {
         double borderDist;
-        Vec2D offs;
-        int cell;
 
         StepState() : borderDist(maxDist)
         {
-        }
-
-        static Vec2D calcCell(const Vec2D &pos, int &cell)
-        {
-            Vec2D offs = pos * invTileSize;  int x = int(offs.x), y = int(offs.y);
-            cell = y * mapLine + x;  return offs - Vec2D(x + 0.5, y + 0.5);
-        }
-
-        void calcCell(const Vec2D &pos)
-        {
-            offs = calcCell(pos, cell);
         }
     };
 
@@ -1579,21 +1603,34 @@ struct AllyState : public CarState
         score -= distPenalty * pow<distPower>(1 - max(0.0, state.borderDist) / maxDist);
         score -= damagePenalty * pow<repairPower>(1 - durability);
         if(powerTarget < 1)score -= reversePenalty;
-        useBonuses(info.type, time + 1);
+        useBonuses(info.type, ++time);
 
-        if(state.cell == cell || abs(state.offs.x) > tileToggle || abs(state.offs.y) > tileToggle)return true;
-        if(state.cell == tileMap.waypoints[waypoint].cell && tileMap.waypoints[waypoint++].finish)
+        if(cell != state.cell && abs(state.offs.x) < tileToggle && abs(state.offs.y) < tileToggle)
         {
-            if(size_t(waypoint) >= tileMap.waypoints.size())  // finish
+            cell = state.cell;
+            if(cell == tileMap.waypoints[waypoint].cell && tileMap.waypoints[waypoint++].finish)
             {
-                score -= nitroCount * nitroCost + ammoCount * ammoCost + oilCount * oilCost;
-                dist = optTileDist;  return true;
+                if(size_t(waypoint) >= tileMap.waypoints.size())  // finish
+                {
+                    score -= nitroCount * nitroCost + ammoCount * ammoCost + oilCount * oilCost;
+                    dist = optTileDist;  return true;
+                }
+                nitroCount++;  ammoCount++;  oilCount++;
             }
-            nitroCount++;  ammoCount++;  oilCount++;
+            unsigned cur = tileMap.calcDist(waypoint - 1, cell, state.offs, dir, spd);
+            if(cur + dist < base)dist = base - cur;
+            else if(cur + dist >= base + optTileDist)return false;
         }
-        unsigned cur = tileMap.calcDist(waypoint - 1, cell = state.cell, state.offs, dir, spd);
-        if(cur + dist >= base)return cur + dist < base + optTileDist;
-        dist = base - cur;  return true;
+        if(time < enemyLookahead)
+        {
+            unsigned cur = tileMap.calcDist(waypoint - 1, cell, state.offs, dir, spd);
+            for(const auto &track : enemyTracks)
+            {
+                int diff = track.dist[time] - cur;
+                score += leadBonus * (enemyLookahead - time) * diff / (tileDist + abs(diff));
+            }
+        }
+        return true;
     }
 
     static int classify(Vec2D vec)
@@ -2294,7 +2331,7 @@ struct Optimizer
         Vec2D spd(car.getSpeedX(), car.getSpeedY());
 
         int waypoint = carData[car.getId()].waypoint - 1, cell;
-        Vec2D offs = AllyState::StepState::calcCell(pos, cell), target(0, 0);
+        Vec2D offs = StepState::calcCell(pos, cell), target(0, 0);
         int base = 12 * (waypoint * mapSize + cell) + 4;  unsigned dist = -1;
         for(int i = 0; i < 4; i++)if(dist > tileMap.distMap[base + i])
         {

@@ -208,13 +208,12 @@ constexpr double ammoCost = 20, nitroCost = 20, oilCost = 20, scoreBonus = 200;
 constexpr int repairPower = 2, firePower = 2;
 constexpr double damagePenalty = 100, damageScore = 500;
 constexpr double slickPenalty = 50, slickScore = 2;
-constexpr double enemyPenalty = 1, enemySlickPenalty = 1;
+constexpr double leadBonus = 1, enemyPenalty = 3;
 constexpr int impactLookahead = 20;
 
 constexpr int distPower = 4;
 constexpr double distPenalty = 100;
 constexpr double reversePenalty = 3;
-constexpr double leadBonus = 1;
 
 constexpr double largeSpeed = 30;
 
@@ -703,14 +702,16 @@ struct TileMap
         }
         int prev = ((type + 3) & 3) | 8;
         if(check.y > check.x)swap(type, prev);
-        unsigned diagDist = min(min(lim, distMap[base + type]),
-            distMap[base + 12 * mapOffs[type & 3] + prev] - diag);
+        unsigned diagDist = min(lim, distMap[base + type]);
+        if(!borders[2 * cell + borderOffs[type & 3]])
+            diagDist = min(diagDist, distMap[base + 12 * mapOffs[type & 3] + prev] - diag);
 
         if(abs(effDir.x) > abs(effDir.y))
              type = signbit(effDir.x) ? 6 : 4;
         else type = signbit(effDir.y) ? 7 : 5;
-        unsigned sideDist = min(min(lim, distMap[base + type]),
-            distMap[base + 12 * mapOffs[type & 3] + type] - tile);
+        unsigned sideDist = min(lim, distMap[base + type]);
+        if(!borders[2 * cell + borderOffs[type & 3]])
+            sideDist = min(sideDist, distMap[base + 12 * mapOffs[type & 3] + type] - tile);
 
         double mul = sqr(2 * effDir.x * effDir.y);
         return lround(sideDist + int(diagDist - sideDist) * mul - (offs * effDir) * tile);
@@ -1563,28 +1564,6 @@ struct AllyState : public CarState
             Vec2D norm, pt;
             if(car.collide(track[time], norm, pt) > -pickupDepth)return false;
         }
-
-        if(time < impactLookahead)for(const auto &track : enemyTracks)
-        {
-            Vec2D norm(0, 0), pt;
-            for(int i = 0; i < enemyTrackCount; i++)if((hitFlags & track.flag[i]) != track.flag[i])
-            {
-                const EnemyPosition &cur = track.pos[time][i];
-                if(car.collide(cur, norm, pt) < -pickupDepth)continue;
-                score -= enemyPenalty * (impactLookahead - time) * max(0.0, norm * (spd - cur.spd));
-                hitFlags |= track.flag[i];
-            }
-
-            /*
-            int hit = 0;
-            for(int t = 0; t < time; t++)
-                for(int i = 0, flag = 1; i < enemyTrackCount; i++, flag <<= 1)
-                    if(car.pointDist2(track.pos[t][i].slickPos()) < slickRadius2)hit |= flag;
-
-            constexpr int bitsum[] = {0, 1, 1, 2, 1, 2, 2, 3};
-            score -= enemySlickPenalty * max(0, bitsum[hit] - 1);
-            */
-        }
         return true;
     }
 
@@ -1627,7 +1606,17 @@ struct AllyState : public CarState
             for(const auto &track : enemyTracks)
             {
                 int diff = track.dist[time] - cur;
-                score += leadBonus * (enemyLookahead - time) * diff / (tileDist + abs(diff));
+                double mul = track.durability > 0 ? diff / double(tileDist + abs(diff)) : 1;
+                score += leadBonus * (enemyLookahead - time) * (mul - 1);
+
+                if(time >= impactLookahead)continue;
+                mul *= enemyPenalty * (impactLookahead - time);
+                Quad car(pos, dir, carHalfWidth, carHalfHeight);  Vec2D norm(0, 0), pt;
+                for(int i = 0; i < enemyTrackCount; i++)if((hitFlags & track.flag[i]) != track.flag[i])
+                {
+                    const EnemyPosition &cur = track.pos[time][i];  if(car.collide(cur, norm, pt) < 0)continue;
+                    score -= mul * max(0.0, norm * (spd - cur.spd));  hitFlags |= track.flag[i];
+                }
             }
         }
         return true;

@@ -1225,6 +1225,8 @@ struct EnemyTrack
 {
     unsigned dist[enemyLookahead + 1];
     EnemyPosition pos[enemyLookahead + 1][enemyTrackCount];
+    int length[enemyTrackCount];
+
     int oilReady;  double durability;
     unsigned flag[enemyTrackCount];
 
@@ -1238,13 +1240,17 @@ struct EnemyTrack
         for(int i = 0; i < enemyTrackCount; i++)
         {
             pos[0][i] = state[i] = start;  flag[i] = 1 << (index++ & 31);
+            length[i] = enemyLookahead + 1;
         }
         for(int time = 1; time <= enemyLookahead; time++)
         {
             unsigned minDist = -1;
-            for(int i = 0; i < enemyTrackCount; i++)
+            for(int i = 0; i < enemyTrackCount; i++)if(time < length[i])
             {
-                state[i].nextStep(info, time - 1, 1, i - 1, false);
+                if(!state[i].nextStep(info, time - 1, 1, i - 1, false))
+                {
+                    length[i] = time;  continue;
+                }
                 addToCells(CarTimeRange::State(state[i].pos, time), ranges, fireCellBorder);
                 pos[time][i] = state[i];  minDist = min(minDist, state[i].dist);
             }
@@ -1342,7 +1348,7 @@ struct AllyState : public CarState
                 if(time < range.startTime || time >= range.endTime)continue;
 
                 const auto &track = enemyTracks[i];
-                for(int j = 0, flag = 1; j < enemyTrackCount; j++)
+                for(int j = 0, flag = 1; j < enemyTrackCount; j++)if(time < track.length[j])
                 {
                     const auto &car = track.pos[time][j];
                     for(int k = 0; k < washerCount; k++, flag <<= 1)
@@ -1356,16 +1362,16 @@ struct AllyState : public CarState
         const int hitMask = (1 << washerCount) - 1;  double best = 0;
         for(size_t i = 0; i < enemyTracks.size(); i++)if(hit[i])
         {
-            const auto &track = enemyTracks[i];  if(track.durability <= 0)continue;
+            double durability = enemyTracks[i].durability;  if(durability <= 0)continue;
 
             int hitCount = washerCount;
             constexpr int bitsum[] = {0, 1, 1, 2, 1, 2, 2, 3};
             for(int j = 0; j < enemyTrackCount; j++, hit[i] >>= washerCount)
                 hitCount = min(hitCount, bitsum[hit[i] & hitMask]);
 
-            double durability = track.durability - hitCount * washerDamage;
-            double delta = pow<firePower>(1 - max(0.0, durability)) - pow<firePower>(1 - track.durability);
-            if(durability < 0)delta += 1;  best = max(best, damageScore * delta);
+            double after = durability - hitCount * washerDamage;
+            double delta = pow<firePower>(1 - max(0.0, after)) - pow<firePower>(1 - durability);
+            if(after < 0)delta += 1;  best = max(best, damageScore * delta);
         }
         if(fireScore < (best -= ammoCost))
         {
@@ -1405,24 +1411,25 @@ struct AllyState : public CarState
                 if(time < range.startTime || time >= range.endTime)continue;
 
                 const auto &track = enemyTracks[i];
-                for(int j = 0; j < enemyTrackCount; j++)if(!(hit[i] & (1 << j)))
-                    if(track.pos[time][j].checkCircle(tire.pos, tireRadius))
-                    {
-                        const auto &car = track.pos[time][j];  Vec2D d = Quad(car).collide(tire.pos);
-                        double damage = tireDamage * max(0.0, (car.spd - tire.spd) * normalize(d));
-                        minDamage[i] = min(minDamage[i], damage);  hit[i] |= 1 << j;
-                    }
+                for(int j = 0, flag = 1; j < enemyTrackCount; j++, flag <<= 1)
+                {
+                    if(time >= track.length[j] || (hit[i] & flag))continue;
+                    if(!track.pos[time][j].checkCircle(tire.pos, tireRadius))continue;
+                    const auto &car = track.pos[time][j];  Vec2D d = Quad(car).collide(tire.pos);
+                    double damage = tireDamage * max(0.0, (car.spd - tire.spd) * normalize(d));
+                    minDamage[i] = min(minDamage[i], damage);  hit[i] |= flag;
+                }
             }
         }
 
         double best = 0;
         for(size_t i = 0; i < enemyTracks.size(); i++)if(hit[i] == allHit)
         {
-            const auto &track = enemyTracks[i];  if(track.durability <= 0)continue;
+            double durability = enemyTracks[i].durability;  if(durability <= 0)continue;
 
-            double durability = track.durability - minDamage[i];
-            double delta = pow<firePower>(1 - max(0.0, durability)) - pow<firePower>(1 - track.durability);
-            if(durability < 0)delta += 1;  best = max(best, damageScore * delta);
+            double after = durability - minDamage[i];
+            double delta = pow<firePower>(1 - max(0.0, after)) - pow<firePower>(1 - durability);
+            if(after < 0)delta += 1;  best = max(best, damageScore * delta);
         }
         if(fireScore < (best -= ammoCost))
         {
@@ -1459,11 +1466,14 @@ struct AllyState : public CarState
             int end = min(enemyLookahead + 1, range.endTime);
             double minSpeed = numeric_limits<double>::infinity();
             for(int time = beg; time < end; time++)
-                for(int j = 0, flag = 1; j < enemyTrackCount; j++, flag <<= 1)if(!(hit & flag))
+                for(int j = 0, flag = 1; j < enemyTrackCount; j++, flag <<= 1)
+                {
+                    if(time >= track.length[j] || (hit & flag))continue;
                     if((track.pos[time][j].pos - slick).sqr() < sqr(slickRadius - pickupDepth))
                     {
                         minSpeed = min(minSpeed, track.pos[time][j].spd.len());  hit |= flag;
                     }
+                }
 
             if(hit == allHit)best += slickScore * minSpeed;
         }
@@ -1612,8 +1622,9 @@ struct AllyState : public CarState
                 if(time >= impactLookahead)continue;
                 mul *= enemyPenalty * (impactLookahead - time);
                 Quad car(pos, dir, carHalfWidth, carHalfHeight);  Vec2D norm(0, 0), pt;
-                for(int i = 0; i < enemyTrackCount; i++)if((hitFlags & track.flag[i]) != track.flag[i])
+                for(int i = 0; i < enemyTrackCount; i++)
                 {
+                    if(time >= track.length[i] || (hitFlags & track.flag[i]) == track.flag[i])continue;
                     const EnemyPosition &cur = track.pos[time][i];  if(car.collide(cur, norm, pt) < 0)continue;
                     score -= mul * max(0.0, norm * (spd - cur.spd));  hitFlags |= track.flag[i];
                 }

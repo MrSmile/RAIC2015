@@ -1603,7 +1603,7 @@ struct AllyState : public CarState
 
         if(cell != state.cell && abs(state.offs.x) < tileToggle && abs(state.offs.y) < tileToggle)
         {
-            cell = state.cell;
+            cell = state.cell;  score -= time;
             if(cell == tileMap.waypoints[waypoint].cell && tileMap.waypoints[waypoint++].finish)
             {
                 if(size_t(waypoint) >= tileMap.waypoints.size())  // finish

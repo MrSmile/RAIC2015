@@ -214,6 +214,7 @@ constexpr int impactLookahead = 20;
 
 constexpr int distPower = 4;
 constexpr double distPenalty = 100;
+constexpr double teammatePenalty = 10;
 constexpr double reversePenalty = 3;
 
 constexpr double largeSpeed = 30;
@@ -221,8 +222,8 @@ constexpr double largeSpeed = 30;
 constexpr int optTileDist = 8 * tileDist, allyLookahead = 600;
 constexpr int enemyTrackCount = 3, enemyLookahead = 50;
 
-constexpr int genLeafLevel = 2, mutateStep = 16;
-constexpr int mutateCount = 4, mutateStages = 16;
+constexpr int genLeafLevel = 2, elongationWidth = 16;
+constexpr int mutateStep = 16, mutateCount = 4, mutateStages = 16;
 
 constexpr int physIter = 1;
 constexpr double physDt = 1.0 / physIter;
@@ -1574,7 +1575,7 @@ struct AllyState : public CarState
         if(size_t(time) < track.size())
         {
             Vec2D norm, pt;
-            if(car.collide(track[time], norm, pt) > -pickupDepth)return false;
+            if(car.collide(track[time], norm, pt) > -pickupDepth)score -= teammatePenalty;
         }
         return true;
     }
@@ -2313,10 +2314,18 @@ struct Optimizer
         assert(buf.empty());
         for(;;)
         {
+            constexpr int n = elongationWidth;  PlanRef group[genLeafLevel][n + 1];
             for(auto &track : best)if(track.second.tileDist < optTileDist && track.second.leafDist < genLeafLevel)
             {
-                buf.push_back(track.second);  track.second.leafDist = numeric_limits<int>::max();
+                PlanRef *top = group[track.second.leafDist];
+                if(track.second.score > top[0].score)
+                {
+                    top[n] = &track.second;  pop_heap(top, top + n + 1);  // not safe
+                }
+                track.second.leafDist = numeric_limits<int>::max();
             }
+            for(int k = 0; k < genLeafLevel; k++)for(int i = 0; i < n; i++)
+                if(group[k][i].plan)buf.push_back(*group[k][i].plan);
             if(buf.empty())break;
 
             for(auto &track : buf)

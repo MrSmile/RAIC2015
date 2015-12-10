@@ -194,8 +194,8 @@ struct CarInfo : public BodyInfo
 };
 
 
-constexpr double maxDist = 16;
-constexpr double pickupDepth = 10;
+constexpr double maxDist = 32;
+constexpr double pickupDepth = 20;
 constexpr double timeEps = 0.001;
 constexpr double spdEps2 = 1e-12;
 
@@ -209,13 +209,13 @@ constexpr double ammoCost = 20, nitroCost = 20, oilCost = 20, scoreBonus = 200;
 constexpr int repairPower = 2, firePower = 2;
 constexpr double damagePenalty = 100, damageScore = 200;
 constexpr double slickPenalty = 50, slickScore = 2;
-constexpr double leadDist = 2 * tileDist, leadBonus = 2, enemyPenalty = 3;
+constexpr double leadDist = 2 * tileDist, leadBonus = 2, enemyPenalty = 10;
 constexpr int impactLookahead = 20;
 
 constexpr int distPower = 4;
-constexpr double distPenalty = 100;
-constexpr double teammatePenalty = 10;
-constexpr double reversePenalty = 3;
+constexpr double distPenalty = 30;
+constexpr double teammatePenalty = 100;
+constexpr double reversePenalty = 10;
 
 constexpr double largeSpeed = 30;
 
@@ -1301,6 +1301,7 @@ struct AllyPosition
 };
 
 vector<AllyPosition> allyTrack[typeCount];
+int firstAlly;
 
 
 struct AllyState : public CarState
@@ -1520,7 +1521,7 @@ struct AllyState : public CarState
         {
             if(solveCollision(info, *this, borderInfo, pt,
                 norm, pt, carBounce, carFrict) < -maxBlowSpeed)return false;
-            pos += depth * norm;
+            pos += depth * norm;  score -= distPenalty;
         }
 
         state.calcCell(pos);
@@ -1571,11 +1572,14 @@ struct AllyState : public CarState
             if((durability -= damage) < 0)return false;  hitFlags |= tire.flag;
         }
 
-        const auto &track = allyTrack[info.type ^ 1];
-        if(size_t(time) < track.size())
+        if(info.type != firstAlly)
         {
-            Vec2D norm, pt;
-            if(car.collide(track[time], norm, pt) > -pickupDepth)score -= teammatePenalty;
+            const auto &track = allyTrack[info.type ^ 1];
+            if(size_t(time) < track.size())
+            {
+                Vec2D norm, pt;
+                if(car.collide(track[time], norm, pt) > -pickupDepth)score -= teammatePenalty;
+            }
         }
         return true;
     }
@@ -2429,17 +2433,16 @@ struct Optimizer
             else allyTrack[i].clear();
         }
 
-        int last;
         switch(flags)
         {
         case 0:  return;
-        case 1 << model::BUGGY:  last = model::BUGGY;  break;
-        case 1 << model::JEEP:   last = model::JEEP;   break;
-        default:  last = start[0].base > start[1].base ? 0 : 1;
+        case 1 << model::BUGGY:  firstAlly = model::BUGGY;  break;
+        case 1 << model::JEEP:   firstAlly = model::JEEP;   break;
+        default:  firstAlly = start[0].base < start[1].base ? 0 : 1;
         }
 
-        process(carInfo[last], start[last]);
-        if(flags != 1 << last)process(carInfo[last ^ 1], start[last ^ 1]);
+        process(carInfo[firstAlly], start[firstAlly]);
+        if(flags != 1 << firstAlly)process(carInfo[firstAlly ^ 1], start[firstAlly ^ 1]);
     }
 };
 

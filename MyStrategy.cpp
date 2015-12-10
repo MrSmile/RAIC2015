@@ -213,7 +213,7 @@ constexpr double leadDist = 2 * tileDist, leadBonus = 2, enemyPenalty = 10;
 constexpr int impactLookahead = 20;
 
 constexpr int distPower = 4;
-constexpr double distPenalty = 30;
+constexpr double distPenalty = 100;
 constexpr double teammatePenalty = 100;
 constexpr double reversePenalty = 10;
 

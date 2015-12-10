@@ -206,7 +206,7 @@ constexpr double maxBlowSpeed = 5;
 constexpr double pickupScore = 5;
 constexpr double ammoCost = 20, nitroCost = 20, oilCost = 20, scoreBonus = 200;
 constexpr int repairPower = 2, firePower = 2;
-constexpr double damagePenalty = 100, damageScore = 500;
+constexpr double damagePenalty = 100, damageScore = 200;
 constexpr double slickPenalty = 50, slickScore = 2;
 constexpr double leadBonus = 1, enemyPenalty = 3;
 constexpr int impactLookahead = 20;
@@ -220,7 +220,9 @@ constexpr double largeSpeed = 30;
 constexpr int tileDist = 256;
 constexpr int optTileDist = 8 * tileDist, allyLookahead = 600;
 constexpr int enemyTrackCount = 3, enemyLookahead = 50;
-constexpr int mutateStep = 16, mutateStages = 16;
+
+constexpr int genLeafLevel = 2, mutateStep = 16;
+constexpr int mutateCount = 4, mutateStages = 16;
 
 constexpr int physIter = 1;
 constexpr double physDt = 1.0 / physIter;
@@ -2142,6 +2144,26 @@ struct Plan
     }
 };
 
+struct PlanRef
+{
+    double score;
+    const Plan *plan;
+
+    PlanRef() : score(-numeric_limits<double>::infinity()), plan(nullptr)
+    {
+    }
+
+    PlanRef &operator = (const Plan *ptr)
+    {
+        score = ptr->score;  plan = ptr;  return *this;
+    }
+
+    bool operator < (const PlanRef &ref) const
+    {
+        return score > ref.score;
+    }
+};
+
 struct Optimizer
 {
     Plan result[typeCount];
@@ -2276,14 +2298,15 @@ struct Optimizer
         cur.update(e_center);  cur.update(e_reverse);
         executeProgram(info, cur, p_back);
 
+        assert(buf.empty());
         for(;;)
         {
-            buf.clear();
-            for(auto &track : best)if(track.second.tileDist < optTileDist && track.second.leafDist < 2)
+            for(auto &track : best)if(track.second.tileDist < optTileDist && track.second.leafDist < genLeafLevel)
             {
                 buf.push_back(track.second);  track.second.leafDist = numeric_limits<int>::max();
             }
             if(buf.empty())break;
+
             for(auto &track : buf)
             {
                 last = track.last;
@@ -2292,16 +2315,18 @@ struct Optimizer
                 ::executeProgram(*this, program[type], info,
                     last->state, cur, last->time, last->time + programDuration[type]);
             }
+            buf.clear();
         }
         for(int i = 0;; i++)
         {
-            double score = tileScore;  Plan *sel = nullptr;
-            for(auto &track : best)if(score < track.second.score)
+            PlanRef top[mutateCount + 1];
+            int n = i < mutateStages ? mutateCount : 1;
+            for(auto &track : best)if(track.second.score > top[0].score)
             {
-                score = track.second.score;  sel = &track.second;
+                top[n] = &track.second;  pop_heap(top, top + n + 1);  // not safe
             }
-
-            if(!sel)
+            for(int i = 0; i < n; i++)if(top[i].plan)buf.push_back(*top[i].plan);
+            if(buf.empty())
             {
 #ifdef PRINT_LOG
                 cout << info.name << ": NOT FOUND!!!" << endl;
@@ -2312,17 +2337,20 @@ struct Optimizer
             else if(i >= mutateStages)
             {
 #ifdef PRINT_LOG
-                cout << info.name << ' ';  sel->print();
+                cout << info.name << ' ';  buf[0].print();
 #endif
-                swap(*sel, old);  lastGood[info.type] = globalTick;  break;
+                swap(buf[0], old);  lastGood[info.type] = globalTick;  break;
             }
-
-            mutate(info, *sel, 0.75, state.turn);
-            mutate(info, *sel, 0.50, state.turn);
-            mutate(info, *sel, 0.25, state.turn);
-            mutate(info, *sel, 0.00, state.turn);
+            for(auto &track : buf)
+            {
+                mutate(info, track, 0.75, state.turn);
+                mutate(info, track, 0.50, state.turn);
+                mutate(info, track, 0.25, state.turn);
+                mutate(info, track, 0.00, state.turn);
+            }
+            buf.clear();
         }
-        last.reset();  generateTrack(info, state, old);
+        buf.clear();  last.reset();  generateTrack(info, state, old);
     }
 
     void executeFallback(const model::Car &car, model::Move &move)
@@ -2374,9 +2402,9 @@ struct Optimizer
         {
             start[car.getType()] = AllyState(car);  flags |= 1 << car.getType();
         }
-        for(int i = 0; i < typeCount; i++)
+        for(int i = 0; i < typeCount; i++)if(!allyTrack[i].empty())
         {
-            if(flags & (1 << i))generateTrack(carInfo[i], start[i], result[i]);
+            if(flags & (1 << i))allyTrack[i].erase(allyTrack[i].begin());
             else allyTrack[i].clear();
         }
 

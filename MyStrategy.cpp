@@ -199,6 +199,7 @@ constexpr double pickupDepth = 10;
 constexpr double timeEps = 0.001;
 constexpr double spdEps2 = 1e-12;
 
+constexpr int tileDist = 256;
 constexpr double tileToggle = 0.49;
 constexpr double tileScore = 1000;
 
@@ -208,7 +209,7 @@ constexpr double ammoCost = 20, nitroCost = 20, oilCost = 20, scoreBonus = 200;
 constexpr int repairPower = 2, firePower = 2;
 constexpr double damagePenalty = 100, damageScore = 200;
 constexpr double slickPenalty = 50, slickScore = 2;
-constexpr double leadBonus = 1, enemyPenalty = 3;
+constexpr double leadDist = 2 * tileDist, leadBonus = 2, enemyPenalty = 3;
 constexpr int impactLookahead = 20;
 
 constexpr int distPower = 4;
@@ -217,7 +218,6 @@ constexpr double reversePenalty = 3;
 
 constexpr double largeSpeed = 30;
 
-constexpr int tileDist = 256;
 constexpr int optTileDist = 8 * tileDist, allyLookahead = 600;
 constexpr int enemyTrackCount = 3, enemyLookahead = 50;
 
@@ -1618,7 +1618,7 @@ struct AllyState : public CarState
             for(const auto &track : enemyTracks)
             {
                 int diff = track.dist[time] - cur;
-                double mul = track.durability > 0 ? diff / double(tileDist + abs(diff)) : 1;
+                double mul = track.durability > 0 ? diff / (leadDist + abs(diff)) : 1;
                 score += leadBonus * (enemyLookahead - time) * (mul - 1);
 
                 if(time >= impactLookahead)continue;
@@ -2281,17 +2281,29 @@ struct Optimizer
         ProgramState cur(info, last->state, {Event(infTime, e_end)}, 0);
         if(!cur.turnEnd)
         {
+            if(state.nitroCount && state.nitroEnd + nitroCooldown <= 0)
+            {
+                cur.update(e_nitro);  executeProgram(info, cur, p_center);
+            }
             cur.update(e_center);  executeProgram(info, cur, p_center);
             cur.update(e_left);    executeProgram(info, cur, p_left);
             cur.update(e_right);   executeProgram(info, cur, p_right);
         }
         else if(cur.prevTurn < 0)
         {
+            if(state.nitroCount && state.nitroEnd + nitroCooldown <= 0)
+            {
+                cur.update(e_nitro);  executeProgram(info, cur, p_left_center);
+            }
             cur.update(e_center);  executeProgram(info, cur, p_left_center);
             cur.update(e_left);    executeProgram(info, cur, p_left);
         }
         else
         {
+            if(state.nitroCount && state.nitroEnd + nitroCooldown <= 0)
+            {
+                cur.update(e_nitro);  executeProgram(info, cur, p_right_center);
+            }
             cur.update(e_center);  executeProgram(info, cur, p_right_center);
             cur.update(e_right);   executeProgram(info, cur, p_right);
         }
